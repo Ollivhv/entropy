@@ -71,6 +71,7 @@ impl EntropyApp {
             #[cfg(target_arch = "wasm32")]
             let known_display_device = false;
             let show_display_item = display_menu_available(known_display_device);
+            let show_qube_screen_item = self.qube_screen_settings_available();
             let layer_leds_available_for_menu = self.layer_led_settings.supported;
             let show_encoders_item = self.show_separate_encoder_visibility_settings(layout);
             let show_layout_options_item = !self.user_layout_option_indices(layout).is_empty();
@@ -135,6 +136,7 @@ impl EntropyApp {
                 + show_matrix_item as usize
                 + show_rgb_item as usize
                 + show_display_item as usize
+                + show_qube_screen_item as usize
                 + show_layer_leds_item as usize
                 + show_encoders_item as usize
                 + show_layout_options_item as usize
@@ -151,6 +153,7 @@ impl EntropyApp {
                 show_rgb_item as usize
                     + show_layer_leds_item as usize
                     + show_display_item as usize
+                    + show_qube_screen_item as usize
                     + show_layout_options_item as usize,
                 show_encoders_item as usize
                     + show_touchpad_item as usize
@@ -179,6 +182,9 @@ impl EntropyApp {
             }
             if show_display_item {
                 settings_menu_labels.push(crate::i18n::tr_catalog(lang, "display_settings.title"));
+            }
+            if show_qube_screen_item {
+                settings_menu_labels.push(crate::i18n::tr_catalog(lang, "qube_screen.title"));
             }
             if show_layer_leds_item {
                 settings_menu_labels.push(crate::i18n::tr(lang, TrKey::LayerLedsTitle));
@@ -247,6 +253,7 @@ impl EntropyApp {
                     matrix_hovered,
                     rgb_hovered,
                     display_hovered,
+                    qube_screen_hovered,
                     layer_leds_hovered,
                     encoders_hovered,
                     layout_options_hovered,
@@ -296,6 +303,17 @@ impl EntropyApp {
                                 true,
                                 self.main_menu_tab == MainMenuTab::Settings
                                     && self.settings_tab == SettingsTab::Display,
+                            )
+                        });
+                        let qube_screen_resp = show_qube_screen_item.then(|| {
+                            top_dropdown_icon_item(
+                                ui,
+                                item_width,
+                                TopMenuIcon::QubeScreen,
+                                crate::i18n::tr_catalog(lang, "qube_screen.title"),
+                                true,
+                                self.main_menu_tab == MainMenuTab::Settings
+                                    && self.settings_tab == SettingsTab::QubeScreen,
                             )
                         });
                         let layout_options_resp = show_layout_options_item.then(|| {
@@ -501,6 +519,14 @@ impl EntropyApp {
                             self.settings_tab = SettingsTab::Display;
                             self.main_menu_tab = MainMenuTab::Settings;
                         }
+                        if qube_screen_resp
+                            .as_ref()
+                            .map(|response| response.clicked())
+                            .unwrap_or(false)
+                        {
+                            self.close_top_dropdowns(ui.ctx());
+                            self.open_qube_screen_settings_page();
+                        }
                         if layer_leds_resp
                             .as_ref()
                             .map(|r| r.clicked())
@@ -594,6 +620,10 @@ impl EntropyApp {
                                 .as_ref()
                                 .map(|resp| resp.hovered())
                                 .unwrap_or(false),
+                            qube_screen_resp
+                                .as_ref()
+                                .map(|resp| resp.hovered())
+                                .unwrap_or(false),
                             layer_leds_resp
                                 .as_ref()
                                 .map(|r| r.hovered())
@@ -628,6 +658,10 @@ impl EntropyApp {
                                     .map(|resp| resp.clicked() && rgb_available)
                                     .unwrap_or(false)
                                 || display_resp
+                                    .as_ref()
+                                    .map(|resp| resp.clicked())
+                                    .unwrap_or(false)
+                                || qube_screen_resp
                                     .as_ref()
                                     .map(|resp| resp.clicked())
                                     .unwrap_or(false)
@@ -668,6 +702,7 @@ impl EntropyApp {
                                 || matrix_hovered
                                 || rgb_hovered
                                 || display_hovered
+                                || qube_screen_hovered
                                 || layer_leds_hovered
                                 || encoders_hovered
                                 || layout_options_hovered

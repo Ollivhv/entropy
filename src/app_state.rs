@@ -1138,6 +1138,9 @@ pub(crate) struct ConnectResult {
     pub(crate) rgb_settings: RgbSettingsState,
     /// LCD accent color, if exposed by the keyboard firmware.
     pub(crate) display_settings: DisplaySettingsState,
+    /// Ergohaven Qube screen settings from QMK settings, if supported
+    /// (qsid 216..=228 plus the shared brightness/colour ids).
+    pub(crate) qube_screen_settings: QubeScreenSettingsState,
     /// Vial layout/display option bitfield, if exposed by `layouts.labels`
     pub(crate) layout_options_value: Option<u32>,
     /// Key Override entries
@@ -2469,6 +2472,274 @@ pub(crate) const CLOCK_MODIFIERS_VISIBLE_QSID: u16 = 352;
 pub(crate) const CLOCK_MODIFIERS_COLOR_QSIDS: [u16; 3] = [353, 354, 355];
 pub(crate) const CLOCK_MODIFIERS_OPACITY_QSID: u16 = 356;
 
+/// QSID that carries the screen concept index of the Ergohaven Qube display
+/// firmware. The concept ids are a firmware contract: `0` is `Dashboard v2`
+/// and `10` is `Mood`.
+pub(crate) const QUBE_SCREEN_CONCEPT_QSID: u16 = 228;
+
+/// First QSID of the Qube screen block (`216` … `228`). The block is unique to
+/// the Qube display firmware, which is what makes it a safe "is this a Qube
+/// screen?" probe: the macropad display pages reuse `318` and `320` … `332`,
+/// so those ids alone cannot tell the two device families apart.
+pub(crate) const QUBE_SCREEN_QSID_RANGE: std::ops::RangeInclusive<u16> = 216..=228;
+
+/// Screen concept labels, indexed by the firmware concept id.
+const QUBE_SCREEN_CONCEPT_VARIANTS: [&str; 11] = [
+    "qube_screen.concept_dashboard_v2",
+    "qube_screen.concept_hud",
+    "qube_screen.concept_terminal",
+    "qube_screen.concept_minimal",
+    "qube_screen.concept_tiles",
+    "qube_screen.concept_speedo",
+    "qube_screen.concept_infocenter",
+    "qube_screen.concept_two_column",
+    "qube_screen.concept_sparkline",
+    "qube_screen.concept_signal",
+    "qube_screen.concept_mood",
+];
+
+/// Header content: 0 media, 1 clock, 2 media + clock.
+const QUBE_SCREEN_HEADER_VARIANTS: [&str; 3] = [
+    "qube_screen.header_media",
+    "qube_screen.header_clock",
+    "qube_screen.header_media_clock",
+];
+
+/// Connection badge place: 0 in the header, 1 as a chip.
+const QUBE_SCREEN_BADGE_VARIANTS: [&str; 2] =
+    ["qube_screen.badge_header", "qube_screen.badge_chip"];
+
+/// Widget rendered for one Qube screen row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QubeScreenFieldKind {
+    /// `u8` 0/1 rendered as a switch.
+    Toggle,
+    /// `u8` index into a fixed, localized variant list.
+    Select {
+        variants: &'static [&'static str],
+    },
+    /// Bounded `u8` rendered as a slider.
+    Number { min: u8, max: u8 },
+    /// Three colour channels rendered as one swatch with a colour picker.
+    Color { qsids: [u16; 3] },
+    /// Short text setting rendered as a text field.
+    Text { max_chars: usize },
+}
+
+/// One row of the Qube screen page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QubeScreenField {
+    pub(crate) qsid: u16,
+    pub(crate) kind: QubeScreenFieldKind,
+    pub(crate) label_key: &'static str,
+    pub(crate) tooltip_key: &'static str,
+}
+
+fn qube_screen_field(
+    qsid: u16,
+    kind: QubeScreenFieldKind,
+    label_key: &'static str,
+    tooltip_key: &'static str,
+) -> QubeScreenField {
+    QubeScreenField {
+        qsid,
+        kind,
+        label_key,
+        tooltip_key,
+    }
+}
+
+/// Rows of the Qube screen page, filtered to the QSIDs the firmware exposes.
+///
+/// The order is deliberate: the screen concept selector leads the page because
+/// switching concepts is the reason the page exists, and the remaining rows
+/// follow the firmware QSID order. A colour row is only offered when all three
+/// of its channels are present, so the app never writes a half-supported
+/// colour.
+pub(crate) fn qube_screen_fields(supported_qmk_settings: &[u16]) -> Vec<QubeScreenField> {
+    // The 216..=228 block is what identifies Qube display firmware. The shared
+    // brightness and colour ids (318, 320..=332) are also used by the macropad
+    // display pages, so on their own they must not enable this page.
+    if !supported_qmk_settings
+        .iter()
+        .any(|qsid| QUBE_SCREEN_QSID_RANGE.contains(qsid))
+    {
+        return Vec::new();
+    }
+
+    let has = |qsid: u16| supported_qmk_settings.contains(&qsid);
+    let mut fields = Vec::new();
+
+    if has(QUBE_SCREEN_CONCEPT_QSID) {
+        fields.push(qube_screen_field(
+            QUBE_SCREEN_CONCEPT_QSID,
+            QubeScreenFieldKind::Select {
+                variants: &QUBE_SCREEN_CONCEPT_VARIANTS,
+            },
+            "qube_screen.concept",
+            "qube_screen.tooltip_concept",
+        ));
+    }
+    if has(216) {
+        fields.push(qube_screen_field(
+            216,
+            QubeScreenFieldKind::Toggle,
+            "qube_screen.wpm_panel",
+            "qube_screen.tooltip_wpm_panel",
+        ));
+    }
+    if has(217) {
+        fields.push(qube_screen_field(
+            217,
+            QubeScreenFieldKind::Select {
+                variants: &QUBE_SCREEN_HEADER_VARIANTS,
+            },
+            "qube_screen.header_content",
+            "qube_screen.tooltip_header_content",
+        ));
+    }
+    if has(218) {
+        fields.push(qube_screen_field(
+            218,
+            QubeScreenFieldKind::Number { min: 0, max: 255 },
+            "qube_screen.idle_timeout",
+            "qube_screen.tooltip_idle_timeout",
+        ));
+    }
+    if has(219) {
+        fields.push(qube_screen_field(
+            219,
+            QubeScreenFieldKind::Toggle,
+            "qube_screen.modifiers",
+            "qube_screen.tooltip_modifiers",
+        ));
+    }
+    if has(220) {
+        fields.push(qube_screen_field(
+            220,
+            QubeScreenFieldKind::Toggle,
+            "qube_screen.batteries",
+            "qube_screen.tooltip_batteries",
+        ));
+    }
+    if has(221) {
+        fields.push(qube_screen_field(
+            221,
+            QubeScreenFieldKind::Toggle,
+            "qube_screen.connection_indicator",
+            "qube_screen.tooltip_connection_indicator",
+        ));
+    }
+    if has(222) {
+        fields.push(qube_screen_field(
+            222,
+            QubeScreenFieldKind::Text { max_chars: 6 },
+            "qube_screen.battery_label_left",
+            "qube_screen.tooltip_battery_label_left",
+        ));
+    }
+    if has(223) {
+        fields.push(qube_screen_field(
+            223,
+            QubeScreenFieldKind::Text { max_chars: 6 },
+            "qube_screen.battery_label_right",
+            "qube_screen.tooltip_battery_label_right",
+        ));
+    }
+    if has(227) {
+        fields.push(qube_screen_field(
+            227,
+            QubeScreenFieldKind::Select {
+                variants: &QUBE_SCREEN_BADGE_VARIANTS,
+            },
+            "qube_screen.badge_place",
+            "qube_screen.tooltip_badge_place",
+        ));
+    }
+    for (qsids, label_key, tooltip_key) in [
+        (
+            [224u16, 225, 226],
+            "qube_screen.accent_shadow",
+            "qube_screen.tooltip_accent_shadow",
+        ),
+        (
+            [320u16, 321, 322],
+            "qube_screen.accent_color",
+            "qube_screen.tooltip_accent_color",
+        ),
+        (
+            [330u16, 331, 332],
+            "qube_screen.background_color",
+            "qube_screen.tooltip_background_color",
+        ),
+    ] {
+        if qsids.iter().all(|qsid| has(*qsid)) {
+            fields.push(qube_screen_field(
+                qsids[0],
+                QubeScreenFieldKind::Color { qsids },
+                label_key,
+                tooltip_key,
+            ));
+        }
+    }
+    if has(318) {
+        fields.push(qube_screen_field(
+            318,
+            QubeScreenFieldKind::Number { min: 10, max: 100 },
+            "qube_screen.brightness",
+            "qube_screen.tooltip_brightness",
+        ));
+    }
+
+    fields
+}
+
+/// Qube screen values read from the device, keyed by QSID.
+///
+/// `values` is what the UI shows (optimistically updated while a write is in
+/// flight); `confirmed` is what the firmware last acknowledged, and is used as
+/// the rollback base for the next write - the same split the display page uses
+/// so a coalesced slider drag never writes a stale "old value".
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QubeScreenSettingsState {
+    /// True when the firmware advertised at least one Qube screen QSID.
+    pub(crate) supported: bool,
+    /// Rows to render, already filtered to the supported QSIDs.
+    pub(crate) fields: Vec<QubeScreenField>,
+    pub(crate) values: std::collections::BTreeMap<u16, u16>,
+    pub(crate) confirmed: std::collections::BTreeMap<u16, u16>,
+    pub(crate) strings: std::collections::BTreeMap<u16, String>,
+    pub(crate) confirmed_strings: std::collections::BTreeMap<u16, String>,
+}
+
+impl QubeScreenSettingsState {
+    pub(crate) fn value(&self, qsid: u16) -> u16 {
+        self.values.get(&qsid).copied().unwrap_or(0)
+    }
+
+    /// Last firmware-acknowledged value, falling back to the optimistic one.
+    pub(crate) fn confirmed_value(&self, qsid: u16) -> u16 {
+        self.confirmed
+            .get(&qsid)
+            .copied()
+            .unwrap_or_else(|| self.value(qsid))
+    }
+
+    pub(crate) fn string(&self, qsid: u16) -> &str {
+        self.strings.get(&qsid).map(String::as_str).unwrap_or("")
+    }
+
+    pub(crate) fn set_value(&mut self, qsid: u16, value: u16) {
+        self.values.insert(qsid, value);
+    }
+
+    /// Records a firmware-confirmed value after a write or a readback mismatch.
+    pub(crate) fn confirm_value(&mut self, qsid: u16, value: u16) {
+        self.confirmed.insert(qsid, value);
+        self.values.insert(qsid, value);
+    }
+}
+
 pub(crate) const DATE_QSIDS: [u16; 15] = [
     357, 358, 359, 360, 361, 362, 363, 364, 365, 366, 367, 368, 369, 370, 371,
 ];
@@ -3301,6 +3572,9 @@ pub(crate) enum SettingsTab {
     AutoShift,
     Rgb,
     Display,
+    /// Ergohaven Qube screen settings (concept selector, layout toggles,
+    /// colours, brightness).
+    QubeScreen,
     LayerLeds,
     Encoders,
     Magic,
@@ -5360,6 +5634,7 @@ pub struct EntropyApp {
     pub(crate) last_single_instance_signal: String,
     pub(crate) rgb_settings: RgbSettingsState,
     pub(crate) display_settings: DisplaySettingsState,
+    pub(crate) qube_screen_settings: QubeScreenSettingsState,
     pub(crate) layout_options_value: Option<u32>,
     pub(crate) encoder_visibility: Vec<bool>,
     pub(crate) combo_term_dirty: bool,
@@ -5606,5 +5881,152 @@ mod layout_image_export_persist_tests {
         let json = r#"{"format":"png","export_pdf":true}"#;
         let state: LayoutImageExportState = serde_json::from_str(json).unwrap();
         assert_eq!(state.format, LayoutImageExportFormat::Pdf);
+    }
+}
+
+#[cfg(test)]
+mod qube_screen_tests {
+    use super::*;
+
+    fn all_qube_qsids() -> Vec<u16> {
+        vec![
+            216, 217, 218, 219, 220, 221, 222, 223, 224, 225, 226, 227, 228, 318, 320, 321, 322,
+            330, 331, 332,
+        ]
+    }
+
+    #[test]
+    fn concept_selector_leads_the_page() {
+        let fields = qube_screen_fields(&all_qube_qsids());
+        let first = fields.first().expect("concept row");
+        assert_eq!(first.qsid, QUBE_SCREEN_CONCEPT_QSID);
+        assert_eq!(
+            first.kind,
+            QubeScreenFieldKind::Select {
+                variants: &QUBE_SCREEN_CONCEPT_VARIANTS
+            }
+        );
+    }
+
+    #[test]
+    fn concept_variant_order_matches_the_firmware_contract() {
+        assert_eq!(QUBE_SCREEN_CONCEPT_VARIANTS.len(), 11);
+        assert_eq!(
+            QUBE_SCREEN_CONCEPT_VARIANTS[0],
+            "qube_screen.concept_dashboard_v2"
+        );
+        assert_eq!(QUBE_SCREEN_CONCEPT_VARIANTS[10], "qube_screen.concept_mood");
+    }
+
+    #[test]
+    fn unsupported_qsids_are_hidden() {
+        let fields = qube_screen_fields(&[216, 228, 318]);
+        let qsids: Vec<u16> = fields.iter().map(|field| field.qsid).collect();
+        assert_eq!(qsids, vec![228, 216, 318]);
+    }
+
+    #[test]
+    fn color_rows_need_every_channel() {
+        // The screen block is present (228), but 320/321 without 322 must not
+        // offer an accent colour row.
+        let fields = qube_screen_fields(&[228, 320, 321]);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].qsid, QUBE_SCREEN_CONCEPT_QSID);
+        let fields = qube_screen_fields(&[228, 320, 321, 322]);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(
+            fields[1].kind,
+            QubeScreenFieldKind::Color {
+                qsids: [320, 321, 322]
+            }
+        );
+    }
+
+    #[test]
+    fn macropad_display_ids_alone_do_not_enable_the_page() {
+        // 318 / 320..332 are shared with the macropad display pages; without a
+        // Qube screen QSID the page must stay hidden.
+        assert!(qube_screen_fields(&[318, 320, 321, 322, 330, 331, 332]).is_empty());
+        let fields = qube_screen_fields(&[216, 318, 320, 321, 322, 330, 331, 332]);
+        assert_eq!(fields[0].qsid, 216);
+        // WPM panel + accent colour + background colour + brightness.
+        assert_eq!(fields.len(), 4);
+    }
+
+    #[test]
+    fn rows_use_the_documented_widgets() {
+        let fields = qube_screen_fields(&all_qube_qsids());
+        let kind = |qsid: u16| {
+            fields
+                .iter()
+                .find(|field| field.qsid == qsid)
+                .map(|field| field.kind)
+        };
+        for qsid in [216u16, 219, 220, 221] {
+            assert_eq!(kind(qsid), Some(QubeScreenFieldKind::Toggle));
+        }
+        assert_eq!(
+            kind(222),
+            Some(QubeScreenFieldKind::Text { max_chars: 6 })
+        );
+        assert_eq!(
+            kind(217),
+            Some(QubeScreenFieldKind::Select {
+                variants: &QUBE_SCREEN_HEADER_VARIANTS
+            })
+        );
+        assert_eq!(
+            kind(227),
+            Some(QubeScreenFieldKind::Select {
+                variants: &QUBE_SCREEN_BADGE_VARIANTS
+            })
+        );
+        assert_eq!(
+            kind(218),
+            Some(QubeScreenFieldKind::Number { min: 0, max: 255 })
+        );
+        assert_eq!(
+            kind(318),
+            Some(QubeScreenFieldKind::Number { min: 10, max: 100 })
+        );
+    }
+
+    #[test]
+    fn qsid_block_is_unique_to_the_qube_screen() {
+        // The macropad display pages reuse 318 and 320…332, so the "Qube screen"
+        // menu row must be driven by the 216…228 block instead.
+        for qsid in QUBE_SCREEN_QSID_RANGE {
+            assert!(
+                ![
+                    DISPLAY_BRIGHTNESS_QSID,
+                    DISPLAY_TIMEOUT_QSID,
+                    DISPLAY_BUTTON_STYLE_QSID
+                ]
+                .contains(&qsid),
+                "qsid {qsid} overlaps the macropad display block"
+            );
+            for block in [
+                DISPLAY_COLOR_QSIDS,
+                DISPLAY_BACKGROUND_COLOR_QSIDS,
+                CLOCK_TEXT_COLOR_QSIDS,
+                CLOCK_BACKGROUND_COLOR_QSIDS,
+                CLOCK_INFO_COLOR_QSIDS,
+                CLOCK_MODIFIERS_COLOR_QSIDS,
+            ] {
+                assert!(!block.contains(&qsid), "qsid {qsid} overlaps a display block");
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_value_tracks_the_firmware_readback() {
+        let mut state = QubeScreenSettingsState::default();
+        state.set_value(218, 30);
+        assert_eq!(state.value(218), 30);
+        // No readback yet: the optimistic value is the rollback base.
+        assert_eq!(state.confirmed_value(218), 30);
+        state.confirm_value(218, 25);
+        assert_eq!(state.confirmed_value(218), 25);
+        assert_eq!(state.value(218), 25);
     }
 }

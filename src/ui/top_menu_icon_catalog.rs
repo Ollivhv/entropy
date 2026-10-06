@@ -82,6 +82,7 @@ pub(super) enum TopMenuIcon {
     Rgb,
     LayerLeds,
     Display,
+    QubeScreen,
     DisplayPresets,
     Encoders,
     Touchpad,
@@ -100,7 +101,7 @@ pub(super) enum TopMenuIcon {
 
 impl TopMenuIcon {
     #[cfg(test)]
-    pub(super) const ALL: [TopMenuIcon; 33] = [
+    pub(super) const ALL: [TopMenuIcon; 34] = [
         TopMenuIcon::Device,
         TopMenuIcon::KeyLegendOrder,
         TopMenuIcon::LayerOperations,
@@ -120,6 +121,7 @@ impl TopMenuIcon {
         TopMenuIcon::Rgb,
         TopMenuIcon::LayerLeds,
         TopMenuIcon::Display,
+        TopMenuIcon::QubeScreen,
         TopMenuIcon::DisplayPresets,
         TopMenuIcon::Encoders,
         TopMenuIcon::Touchpad,
@@ -163,6 +165,9 @@ impl TopMenuIcon {
             TopMenuIcon::Rgb => ("💡", Lighting),
             TopMenuIcon::LayerLeds => ("🚦", Lighting),
             TopMenuIcon::Display => ("🖥", Lighting),
+            // A filled square reads as "another screen panel" next to the
+            // Display monitor without repeating its glyph.
+            TopMenuIcon::QubeScreen => ("▣", Lighting),
             TopMenuIcon::DisplayPresets => ("🎞", Lighting),
             TopMenuIcon::Encoders => ("🎛", Input),
             TopMenuIcon::Touchpad => ("🖱", Input),
@@ -213,10 +218,11 @@ mod tests {
         TopMenuIcon::AutoShift,
         TopMenuIcon::KeyOverrides,
     ];
-    const CONFIG_MENU_ICONS: [TopMenuIcon; 17] = [
+    const CONFIG_MENU_ICONS: [TopMenuIcon; 18] = [
         TopMenuIcon::Rgb,
         TopMenuIcon::LayerLeds,
         TopMenuIcon::Display,
+        TopMenuIcon::QubeScreen,
         TopMenuIcon::DisplayPresets,
         TopMenuIcon::Encoders,
         TopMenuIcon::Touchpad,

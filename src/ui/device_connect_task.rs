@@ -706,6 +706,7 @@ impl EntropyApp {
             self.alt_repeat_pick_target = None;
             self.rgb_settings = RgbSettingsState::default();
             self.display_settings = DisplaySettingsState::default();
+            self.qube_screen_settings = QubeScreenSettingsState::default();
             self.layout_options_value = None;
             self.encoder_visibility.clear();
             self.keycode_picker.macro_count = 0;
@@ -1309,6 +1310,9 @@ impl EntropyApp {
                     DisplaySettingsState::default()
                 };
 
+                let qube_screen_settings =
+                    Self::read_qube_screen_settings(&supported_qmk_settings, &dev_conn);
+
                 progress("Reading tap dance entries…")?;
                 let mut tap_dance_entries = if staged_bluetooth_load {
                     vec![crate::keycode_picker::TapDanceEntry::default(); tap_dance_count as usize]
@@ -1546,6 +1550,7 @@ impl EntropyApp {
                     layer_led_settings,
                     rgb_settings,
                     display_settings,
+                    qube_screen_settings,
                     layout_options_value,
                     key_override_entries,
                     alt_repeat_entries,

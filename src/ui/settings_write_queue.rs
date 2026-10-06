@@ -52,6 +52,9 @@ enum SettingsWriteTarget {
     Display {
         display_label: String,
     },
+    QubeScreen {
+        display_label: String,
+    },
 }
 
 impl SettingsWriteTarget {
@@ -62,7 +65,8 @@ impl SettingsWriteTarget {
             | Self::TapHold { display_label }
             | Self::OneShot { display_label }
             | Self::LayerLed { display_label }
-            | Self::Display { display_label } => display_label,
+            | Self::Display { display_label }
+            | Self::QubeScreen { display_label } => display_label,
         }
     }
 
@@ -88,6 +92,9 @@ impl SettingsWriteTarget {
             Self::Display { display_label } => {
                 format!("display field={display_label:?}")
             }
+            Self::QubeScreen { display_label } => {
+                format!("qube-screen field={display_label:?}")
+            }
         }
     }
 
@@ -99,6 +106,16 @@ impl SettingsWriteTarget {
         matches!(self, Self::Display { .. })
     }
 
+    fn is_qube_screen(&self) -> bool {
+        matches!(self, Self::QubeScreen { .. })
+    }
+
+    /// Writes that coalesce: dragging a slider or a colour picker queues many
+    /// values per frame, and only the newest one matters.
+    fn coalesces_pending_write(&self) -> bool {
+        self.is_display() || self.is_qube_screen()
+    }
+
     fn verifies_readback(&self, is_bluetooth_transport: bool) -> bool {
         // RMK persists device settings asynchronously after SET, so an immediate
         // GET can collide with that flash work over Bluetooth. USB Layer LED
@@ -106,6 +123,7 @@ impl SettingsWriteTarget {
         // without applying the requested value.
         self.is_touchpad()
             || matches!(self, Self::Display { .. })
+            || matches!(self, Self::QubeScreen { .. })
             || (matches!(self, Self::LayerLed { .. }) && !is_bluetooth_transport)
     }
 
@@ -162,6 +180,10 @@ impl SettingsWriteTarget {
             }
             Self::LayerLed { .. } => {
                 layer_led_settings.set_value(qsid, readback);
+            }
+            Self::QubeScreen { .. } => {
+                // Qube screen readbacks are reconciled by the caller, which
+                // owns the Qube screen state (see `finish_settings_write`).
             }
             Self::Display { .. } => {
                 let value = readback.min(u8::MAX as u16) as u8;
@@ -294,11 +316,13 @@ impl SettingsWriteQueueState {
         );
         let id = request.id;
 
-        if request.target.is_display() {
+        if request.target.coalesces_pending_write() {
             if let Some(existing) = self
                 .pending
                 .iter_mut()
-                .find(|existing| existing.qsid == request.qsid && existing.target.is_display())
+                .find(|existing| {
+                    existing.qsid == request.qsid && existing.target.coalesces_pending_write()
+                })
             {
                 request.old_value = existing.old_value;
                 *existing = request;
@@ -651,6 +675,28 @@ impl EntropyApp {
         });
     }
 
+    /// Queues one `u8` Qube screen write. Like the display page, the write is
+    /// coalesced while the user drags a slider and verified by readback, so a
+    /// firmware-side clamp or rejection never leaves the app showing a value
+    /// the device did not accept.
+    pub(super) fn queue_qube_screen_setting_write(
+        &mut self,
+        display_label: String,
+        qsid: u16,
+        old_value: u16,
+        requested: u16,
+    ) {
+        self.queue_settings_write(SettingsWriteRequest {
+            id: 0,
+            generation: self.settings_write_generation,
+            qsid,
+            width: 1,
+            old_value,
+            requested,
+            target: SettingsWriteTarget::QubeScreen { display_label },
+        });
+    }
+
     fn queue_settings_write(&mut self, request: SettingsWriteRequest) {
         let label = request.target.display_label().to_owned();
         let context = request.target.log_context();
@@ -843,6 +889,10 @@ impl EntropyApp {
                         request.qsid,
                         readback,
                     );
+                    if request.target.is_qube_screen() {
+                        self.qube_screen_settings
+                            .confirm_value(request.qsid, readback);
+                    }
                     if request.target.is_touchpad() {
                         self.status_msg = crate::i18n::tr_catalog_format(
                             self.app_settings.language,
@@ -884,6 +934,9 @@ impl EntropyApp {
                             request.qsid,
                             *actual,
                         );
+                        if request.target.is_qube_screen() {
+                            self.qube_screen_settings.confirm_value(request.qsid, *actual);
+                        }
                     }
                     self.status_msg = crate::i18n::tr_catalog_format(
                         self.app_settings.language,

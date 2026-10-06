@@ -86,6 +86,10 @@ impl EntropyApp {
                 self.draw_display_settings_page(ui, content_rect);
                 false
             }
+            SettingsTab::QubeScreen => {
+                self.draw_qube_screen_settings_page(ui, content_rect);
+                false
+            }
             SettingsTab::LayerLeds => {
                 self.draw_layer_led_settings_page(ui, content_rect);
                 false
@@ -209,6 +213,11 @@ impl EntropyApp {
 
     pub(super) fn open_app_settings_page(&mut self) {
         self.settings_tab = SettingsTab::AppSettings;
+        self.main_menu_tab = MainMenuTab::Settings;
+    }
+
+    pub(super) fn open_qube_screen_settings_page(&mut self) {
+        self.settings_tab = SettingsTab::QubeScreen;
         self.main_menu_tab = MainMenuTab::Settings;
     }
 
