@@ -1840,8 +1840,15 @@ fn response_matches_qmk_settings_get(command: &[u8], resp: &[u8; MSG_LEN]) -> bo
     }
 
     let payload = &resp[1..];
+    // A name answer must be NUL-terminated UTF-8. Some firmwares also park
+    // plain numeric device settings inside this block: the Ergohaven Qube dongle
+    // answers its screen settings (216..=228) with one value byte followed by
+    // 0xFF padding and no string terminator at all. Rejecting that shape does
+    // not make the read safer — it keeps waiting for a reply that will never
+    // come, and the connection is then dropped as a transport failure — so an
+    // answer with nothing name-shaped in it counts as a numeric value.
     let Some(end) = payload.iter().position(|byte| *byte == 0) else {
-        return false;
+        return true;
     };
     end <= 15 && std::str::from_utf8(&payload[..end]).is_ok()
 }
@@ -2586,6 +2593,34 @@ mod tests {
         let mut valid_name = [0u8; MSG_LEN];
         valid_name[1..5].copy_from_slice(b"Nav\0");
         assert!(response_matches_command(&command, &valid_name));
+    }
+
+    #[test]
+    fn qmk_settings_get_accepts_numeric_answer_inside_the_layer_name_block() {
+        // The Qube dongle stores its screen settings on QSIDs 216..=228, which
+        // lie inside the layer-name block (200..=231). Those ids answer with a
+        // single value byte and 0xFF padding - no string terminator - and the
+        // response must be accepted, otherwise the read waits forever and the
+        // whole connection is dropped as a transport failure.
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_GET, 216);
+        let mut numeric = [u8::MAX; MSG_LEN];
+        numeric[0] = 0;
+        numeric[1] = 1;
+        assert!(response_matches_command(&command, &numeric));
+
+        // A string answer to the same id still matches.
+        let mut name = [u8::MAX; MSG_LEN];
+        name[0] = 0;
+        name[1..5].copy_from_slice(b"Base");
+        name[5] = 0;
+        assert!(response_matches_command(&command, &name));
+
+        // A stale payload that does contain a terminator is still rejected.
+        let mut stale = [u8::MAX; MSG_LEN];
+        stale[0] = 0;
+        stale[1] = 0xEA;
+        stale[2] = 0;
+        assert!(!response_matches_command(&command, &stale));
     }
 
     #[test]

@@ -2551,6 +2551,11 @@ fn qube_screen_field(
 
 /// Rows of the Qube screen page, filtered to the QSIDs the firmware exposes.
 ///
+/// This is the second half of the page gate: [`definition_declares_qube_screen`]
+/// proves the firmware means these QSIDs as screen settings, and this function
+/// then keeps only the subset the running firmware actually advertises in its
+/// QMK settings list. A QSID the device did not announce is never read.
+///
 /// The order is deliberate: the screen concept selector leads the page because
 /// switching concepts is the reason the page exists, and the remaining rows
 /// follow the firmware QSID order. A colour row is only offered when all three
@@ -2692,6 +2697,33 @@ pub(crate) fn qube_screen_fields(supported_qmk_settings: &[u16]) -> Vec<QubeScre
     }
 
     fields
+}
+
+/// True when the connected firmware *declares* Qube screen settings - a Vial
+/// definition field on one of the QSIDs 216..=228 that is not a layer name.
+///
+/// Announcing those QSIDs is not enough on its own: they sit inside the
+/// layer-name block (200..=231), so a keyboard with more than 16 layers also
+/// advertises them, for layer names. Layer names are always declared as
+/// `string` fields, while the Qube block is switches, selectors, numbers and
+/// two short labels, so a non-string field is what separates the two families.
+pub(crate) fn definition_declares_qube_screen(json: &serde_json::Value) -> bool {
+    json.get("settings")
+        .and_then(serde_json::Value::as_array)
+        .map(|tabs| {
+            tabs.iter()
+                .filter_map(|tab| tab.get("fields").and_then(serde_json::Value::as_array))
+                .flatten()
+                .any(|field| {
+                    let is_qube_qsid = field
+                        .get("qsid")
+                        .and_then(serde_json::Value::as_u64)
+                        .and_then(|qsid| u16::try_from(qsid).ok())
+                        .is_some_and(|qsid| QUBE_SCREEN_QSID_RANGE.contains(&qsid));
+                    is_qube_qsid && field.get("type").and_then(serde_json::Value::as_str) != Some("string")
+                })
+        })
+        .unwrap_or(false)
 }
 
 /// Qube screen values read from the device, keyed by QSID.
@@ -5951,6 +5983,61 @@ mod qube_screen_tests {
         assert_eq!(fields[0].qsid, 216);
         // WPM panel + accent colour + background colour + brightness.
         assert_eq!(fields.len(), 4);
+    }
+
+    #[test]
+    fn page_requires_a_definition_that_declares_qube_fields() {
+        // A device that announces 216..228 only because they are layer-name
+        // slots (more than 16 layers) must not count as a Qube screen: those
+        // fields are strings, exactly like every other layer name.
+        let layer_names_only = serde_json::json!({
+            "settings": [{
+                "name": "Layer names",
+                "fields": [
+                    {"type": "string", "title": "Layer 0", "qsid": 200},
+                    {"type": "string", "title": "Layer 16", "qsid": 216}
+                ]
+            }]
+        });
+        assert!(!definition_declares_qube_screen(&layer_names_only));
+
+        // A macropad display definition: those QSIDs exist, but never in the
+        // Qube screen block.
+        let macropad_like = serde_json::json!({
+            "settings": [{
+                "name": "Display",
+                "fields": [
+                    {"type": "integer", "title": "Brightness", "qsid": 318},
+                    {"type": "integer", "title": "Accent R", "qsid": 320}
+                ]
+            }]
+        });
+        assert!(!definition_declares_qube_screen(&macropad_like));
+
+        let qube = serde_json::json!({
+            "settings": [{
+                "name": "Qube screen",
+                "fields": [
+                    {"type": "boolean", "title": "WPM panel", "qsid": 216, "bit": 0},
+                    {"type": "select", "title": "Screen concept", "qsid": 228,
+                     "variants": ["Dashboard v2", "HUD"]}
+                ]
+            }]
+        });
+        assert!(definition_declares_qube_screen(&qube));
+
+        // A Qube firmware that only carries the two battery labels would still
+        // be a Qube screen block, but without a non-string field we cannot tell
+        // it apart from layer names, so the page stays hidden.
+        let labels_only = serde_json::json!({
+            "settings": [{
+                "name": "Qube screen",
+                "fields": [{"type": "string", "title": "Battery label left", "qsid": 222}]
+            }]
+        });
+        assert!(!definition_declares_qube_screen(&labels_only));
+
+        assert!(!definition_declares_qube_screen(&serde_json::json!({})));
     }
 
     #[test]

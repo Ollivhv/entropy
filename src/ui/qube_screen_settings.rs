@@ -3,14 +3,22 @@ use super::*;
 impl EntropyApp {
     /// Reads every Qube screen setting the firmware advertises.
     ///
-    /// Unsupported QSIDs are skipped, so the page only ever shows rows the
-    /// device can actually store. Values are read while connecting, exactly
-    /// like the macropad display page, so the page is populated the moment it
-    /// is opened.
+    /// The page is gated twice: the definition must declare Qube screen fields
+    /// at all ([`definition_declares_qube_screen`]), and each row must be backed
+    /// by a QSID the firmware advertises in its QMK settings list. Only those
+    /// QSIDs are read - anything the device did not announce is left untouched,
+    /// so a keyboard that merely reuses the layer-name block never sees a Qube
+    /// read. Values are read while connecting, exactly like the macropad display
+    /// page, so the page is populated the moment it is opened.
     pub(super) fn read_qube_screen_settings(
+        json: &serde_json::Value,
         supported_qmk_settings: &[u16],
         dev_conn: &crate::hid::HidDevice,
     ) -> QubeScreenSettingsState {
+        if !definition_declares_qube_screen(json) {
+            return QubeScreenSettingsState::default();
+        }
+
         let mut state = QubeScreenSettingsState {
             fields: qube_screen_fields(supported_qmk_settings),
             ..QubeScreenSettingsState::default()
@@ -18,20 +26,17 @@ impl EntropyApp {
         state.supported = !state.fields.is_empty();
 
         for field in state.fields.clone() {
-            match field.kind {
+            let outcome = match field.kind {
                 QubeScreenFieldKind::Text { .. } => {
-                    match dev_conn.get_qmk_setting_string(field.qsid) {
-                        Ok(value) => {
+                    dev_conn
+                        .get_qmk_setting_string(field.qsid)
+                        .map(|value| {
                             state.strings.insert(field.qsid, value.clone());
                             state.confirmed_strings.insert(field.qsid, value);
-                        }
-                        Err(error) => log::warn!(
-                            "get_qmk_setting_string(qube screen qsid {}): {error}",
-                            field.qsid
-                        ),
-                    }
+                        })
                 }
                 QubeScreenFieldKind::Color { qsids } => {
+                    let mut outcome = Ok(());
                     for qsid in qsids {
                         match dev_conn.get_qmk_setting_u8(qsid) {
                             Ok(value) => {
@@ -39,21 +44,30 @@ impl EntropyApp {
                                 state.values.insert(qsid, u16::from(value));
                             }
                             Err(error) => {
-                                log::warn!("get_qmk_setting_u8(qube screen qsid {qsid}): {error}")
+                                outcome = Err(error);
+                                break;
                             }
                         }
                     }
+                    outcome
                 }
-                _ => match dev_conn.get_qmk_setting_u8(field.qsid) {
-                    Ok(value) => {
-                        state.confirmed.insert(field.qsid, u16::from(value));
-                        state.values.insert(field.qsid, u16::from(value));
-                    }
-                    Err(error) => log::warn!(
-                        "get_qmk_setting_u8(qube screen qsid {}): {error}",
-                        field.qsid
-                    ),
-                },
+                _ => dev_conn.get_qmk_setting_u8(field.qsid).map(|value| {
+                    state.confirmed.insert(field.qsid, u16::from(value));
+                    state.values.insert(field.qsid, u16::from(value));
+                }),
+            };
+
+            if let Err(error) = outcome {
+                if crate::hid::is_disconnect_error(&error) {
+                    // The transport is gone: every later read would fail the
+                    // same way, and repeating them only buries the real error.
+                    log::warn!("qube screen settings read stopped: {error}");
+                    break;
+                }
+                log::warn!(
+                    "get_qmk_setting(qube screen qsid {}): {error}",
+                    field.qsid
+                );
             }
         }
 

@@ -1311,7 +1311,7 @@ impl EntropyApp {
                 };
 
                 let qube_screen_settings =
-                    Self::read_qube_screen_settings(&supported_qmk_settings, &dev_conn);
+                    Self::read_qube_screen_settings(&json, &supported_qmk_settings, &dev_conn);
 
                 progress("Reading tap dance entries…")?;
                 let mut tap_dance_entries = if staged_bluetooth_load {
