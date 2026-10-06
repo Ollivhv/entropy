@@ -1756,9 +1756,16 @@ fn response_matches_command(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
         | CMD_VIA_MACRO_SET_BUFFER => resp[0] == cmd,
         CMD_VIA_VIAL_PREFIX => response_matches_vial_command(command, resp),
         0xE6 if is_application_layout_capability_probe(command) => {
+            // 0x5A acknowledges firmware that implements the application-layout
+            // protocol. Firmware that does not implement it answers by echoing
+            // the probe (0xA5) - the M4CR0Pad v2 on firmware 4.0.6 does exactly
+            // that. The echo is a complete answer meaning "not supported": if it
+            // were treated as a stale report, the read would keep waiting until
+            // the deadline and the HID transport would be retired, which drops
+            // the whole connection.
             resp[0] == 0xE6
                 && resp[1] == crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION
-                && resp[2] == 0x5A
+                && matches!(resp[2], 0x5A | 0xA5)
         }
         // Keep reading for this command within the original deadline when a
         // delayed response from another pictogram command arrives. Never resend.
@@ -2338,6 +2345,45 @@ mod tests {
         assert!(response_matches_command(&request, &response));
         response[2] = 0;
         assert!(!response_matches_command(&request, &response));
+    }
+
+    #[test]
+    fn application_layout_probe_accepts_the_unsupported_echo() {
+        // Firmware without the application-layout protocol echoes the probe
+        // instead of acknowledging it. That echo has to count as an answer, so
+        // the caller learns "not supported" right away: waiting for the read
+        // deadline would retire the HID transport and drop the whole
+        // connection, which is what happened on the M4CR0Pad v2 (firmware
+        // 4.0.6) - the app fell back to the device list every time.
+        let request = [
+            0xE6,
+            crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+            0xA5,
+            0,
+            0,
+        ];
+        let mut echo = [0u8; MSG_LEN];
+        echo[..request.len()].copy_from_slice(&request);
+        assert!(response_matches_command(&request, &echo));
+
+        // The acknowledgement still matches.
+        let mut ack = [0u8; MSG_LEN];
+        ack[..3].copy_from_slice(&[
+            0xE6,
+            crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+            0x5A,
+        ]);
+        assert!(response_matches_command(&request, &ack));
+
+        // Unrelated payloads stay rejected.
+        let mut unrelated = [0u8; MSG_LEN];
+        unrelated[..3].copy_from_slice(&[
+            0xE6,
+            crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+            0x11,
+        ]);
+        assert!(!response_matches_command(&request, &unrelated));
+        assert!(!response_matches_command(&request, &[0u8; MSG_LEN]));
     }
 
     #[test]
