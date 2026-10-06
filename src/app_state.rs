@@ -2484,7 +2484,7 @@ pub(crate) const QUBE_SCREEN_CONCEPT_QSID: u16 = 228;
 pub(crate) const QUBE_SCREEN_QSID_RANGE: std::ops::RangeInclusive<u16> = 216..=228;
 
 /// Screen concept labels, indexed by the firmware concept id.
-const QUBE_SCREEN_CONCEPT_VARIANTS: [&str; 11] = [
+const QUBE_SCREEN_CONCEPT_VARIANTS: [&str; 14] = [
     "qube_screen.concept_dashboard_v2",
     "qube_screen.concept_hud",
     "qube_screen.concept_terminal",
@@ -2496,6 +2496,9 @@ const QUBE_SCREEN_CONCEPT_VARIANTS: [&str; 11] = [
     "qube_screen.concept_sparkline",
     "qube_screen.concept_signal",
     "qube_screen.concept_mood",
+    "qube_screen.concept_battiles",
+    "qube_screen.concept_mediacenter",
+    "qube_screen.concept_board",
 ];
 
 /// Header content: 0 media, 1 clock, 2 media + clock.
@@ -2663,19 +2666,54 @@ pub(crate) fn qube_screen_fields(supported_qmk_settings: &[u16]) -> Vec<QubeScre
     }
     for (qsids, label_key, tooltip_key) in [
         (
-            [224u16, 225, 226],
-            "qube_screen.accent_shadow",
-            "qube_screen.tooltip_accent_shadow",
-        ),
-        (
             [320u16, 321, 322],
             "qube_screen.accent_color",
             "qube_screen.tooltip_accent_color",
         ),
         (
+            [224u16, 225, 226],
+            "qube_screen.accent_shadow",
+            "qube_screen.tooltip_accent_shadow",
+        ),
+        (
             [330u16, 331, 332],
             "qube_screen.background_color",
             "qube_screen.tooltip_background_color",
+        ),
+        (
+            [230u16, 231, 232],
+            "qube_screen.panel_color",
+            "qube_screen.tooltip_panel_color",
+        ),
+        (
+            [233u16, 234, 235],
+            "qube_screen.border_color",
+            "qube_screen.tooltip_border_color",
+        ),
+        (
+            [236u16, 237, 238],
+            "qube_screen.text_color",
+            "qube_screen.tooltip_text_color",
+        ),
+        (
+            [239u16, 240, 241],
+            "qube_screen.label_color",
+            "qube_screen.tooltip_label_color",
+        ),
+        (
+            [242u16, 243, 244],
+            "qube_screen.bar_color",
+            "qube_screen.tooltip_bar_color",
+        ),
+        (
+            [245u16, 246, 247],
+            "qube_screen.warning_color",
+            "qube_screen.tooltip_warning_color",
+        ),
+        (
+            [248u16, 249, 250],
+            "qube_screen.critical_color",
+            "qube_screen.tooltip_critical_color",
         ),
     ] {
         if qsids.iter().all(|qsid| has(*qsid)) {
@@ -5942,12 +5980,21 @@ mod qube_screen_tests {
 
     #[test]
     fn concept_variant_order_matches_the_firmware_contract() {
-        assert_eq!(QUBE_SCREEN_CONCEPT_VARIANTS.len(), 11);
+        assert_eq!(QUBE_SCREEN_CONCEPT_VARIANTS.len(), 14);
         assert_eq!(
             QUBE_SCREEN_CONCEPT_VARIANTS[0],
             "qube_screen.concept_dashboard_v2"
         );
         assert_eq!(QUBE_SCREEN_CONCEPT_VARIANTS[10], "qube_screen.concept_mood");
+        assert_eq!(
+            QUBE_SCREEN_CONCEPT_VARIANTS[11],
+            "qube_screen.concept_battiles"
+        );
+        assert_eq!(
+            QUBE_SCREEN_CONCEPT_VARIANTS[12],
+            "qube_screen.concept_mediacenter"
+        );
+        assert_eq!(QUBE_SCREEN_CONCEPT_VARIANTS[13], "qube_screen.concept_board");
     }
 
     #[test]

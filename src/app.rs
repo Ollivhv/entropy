@@ -186,6 +186,8 @@ use qmk_settings_write_queue::QmkSettingsWriteQueue;
 mod portable_settings;
 #[path = "ui/qube_screen_settings.rs"]
 mod qube_screen_settings_ui;
+#[path = "ui/qube_screen_preview.rs"]
+mod qube_screen_preview_ui;
 #[path = "ui/rgb_settings.rs"]
 mod rgb_settings_ui;
 #[path = "ui/settings_shell.rs"]

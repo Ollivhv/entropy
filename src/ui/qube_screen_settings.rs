@@ -1,4 +1,8 @@
 use super::*;
+use super::qube_screen_preview_ui::{
+    paint_qube_screen_preview, qube_screen_fit, qube_screen_panel_rects, QubePreviewData,
+    QUBE_THEMES,
+};
 
 impl EntropyApp {
     /// Reads every Qube screen setting the firmware advertises.
@@ -99,7 +103,7 @@ impl EntropyApp {
         };
 
         crate::ui_style::allocate_ui_at_rect(ui, content_rect, |ui| {
-            ui.vertical_centered(|ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.add_space(18.0);
                 ui.label(
                     RichText::new(crate::i18n::tr_catalog(lang, "qube_screen.title"))
@@ -137,36 +141,192 @@ impl EntropyApp {
 
                 let metrics = crate::ui_style::ResponsiveMetrics::from_ctx(ui.ctx());
                 let row_count = self.qube_screen_settings.fields.len();
-                let list = allocate_adaptive_settings_list_viewport(
-                    ui,
-                    "qube_screen_settings",
-                    metrics,
-                    row_count,
-                    0.0,
-                );
-                crate::ui_style::allocate_ui_at_rect(ui, list.content_rect, |ui| {
-                    ui.set_clip_rect(list.viewport);
-                    ui.set_min_size(list.content_rect.size());
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    self.draw_qube_screen_rows(
-                        ui,
-                        list.first_visible_row..list.last_visible_row,
-                        metrics,
-                        list.suppress_tooltips,
-                    );
-                });
+                let body = ui.available_rect_before_wrap();
+                let (preview_rect, settings_rect, side_by_side) =
+                    qube_screen_panel_rects(body, metrics.settings_content_width());
+                self.draw_qube_screen_preview_panel(ui, preview_rect, side_by_side);
+                crate::ui_style::allocate_ui_at_rect(ui, settings_rect, |ui| {
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                        let theme_writes = QUBE_THEMES[0]
+                            .writes(&self.supported_qmk_settings)
+                            .len();
+                        if theme_writes > 0 {
+                            ui.label(
+                                RichText::new(crate::i18n::tr_catalog(
+                                    lang,
+                                    "qube_screen.theme_title",
+                                ))
+                                .size(11.0)
+                                .color(app_muted_text(dark)),
+                            )
+                            .on_hover_text(crate::i18n::tr_catalog(
+                                lang,
+                                "qube_screen.tooltip_theme_title",
+                            ));
+                            ui.add_space(6.0);
+                            let theme_labels: Vec<String> = QUBE_THEMES
+                                .iter()
+                                .map(|theme| {
+                                    crate::i18n::tr_catalog(lang, theme.label_key).to_owned()
+                                })
+                                .collect();
+                            let active_theme = QUBE_THEMES
+                                .iter()
+                                .position(|theme| {
+                                    theme.matches(&self.qube_screen_settings.values)
+                                })
+                                .unwrap_or(theme_labels.len());
+                            let control_width =
+                                metrics.settings_content_width() - metrics.value(8.0);
+                            if let Some(picked) = crate::ui_style::settings_segmented_control(
+                                ui,
+                                "qube_screen_theme",
+                                &theme_labels,
+                                active_theme,
+                                egui::vec2(control_width, metrics.value(34.0)),
+                            ) {
+                                self.apply_qube_theme(picked);
+                            }
+                            ui.add_space(12.0);
+                        }
+                        let list = allocate_adaptive_settings_list_viewport(
+                            ui,
+                            "qube_screen_settings",
+                            metrics,
+                            row_count,
+                            0.0,
+                        );
+                        crate::ui_style::allocate_ui_at_rect(ui, list.content_rect, |ui| {
+                            ui.set_clip_rect(list.viewport);
+                            ui.set_min_size(list.content_rect.size());
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            self.draw_qube_screen_rows(
+                                ui,
+                                list.first_visible_row..list.last_visible_row,
+                                metrics,
+                                list.suppress_tooltips,
+                            );
+                        });
 
-                if list.has_scrollbar {
-                    crate::ui_style::paint_floating_scrollbar_handle(
-                        ui,
-                        list.track_rect,
-                        list.handle_height,
-                        list.scroll_ratio,
-                        list.track_hovered,
-                    );
-                }
+                        if list.has_scrollbar {
+                            crate::ui_style::paint_floating_scrollbar_handle(
+                                ui,
+                                list.track_rect,
+                                list.handle_height,
+                                list.scroll_ratio,
+                                list.track_hovered,
+                            );
+                        }
+                    });
+                });
             });
         });
+    }
+
+    /// Draws the 280×240 screen preview and the concept caption under it.
+    fn draw_qube_screen_preview_panel(
+        &self,
+        ui: &mut egui::Ui,
+        panel: egui::Rect,
+        side_by_side: bool,
+    ) {
+        let data = self.qube_preview_data();
+        let caption_height = if side_by_side { 30.0 } else { 26.0 };
+        let screen_area = egui::Rect::from_min_max(
+            panel.min,
+            egui::pos2(panel.right(), (panel.bottom() - caption_height).max(panel.top() + 40.0)),
+        );
+        let screen = qube_screen_fit(screen_area);
+        let caption = self.qube_concept_label(data.concept);
+
+        crate::ui_style::allocate_ui_at_rect(ui, panel, |ui| {
+            paint_qube_screen_preview(ui, screen, &data);
+            ui.painter().text(
+                egui::pos2(screen.center().x, screen.bottom() + 14.0),
+                egui::Align2::CENTER_CENTER,
+                caption,
+                egui::FontId::proportional(12.0),
+                app_muted_text(ui.visuals().dark_mode),
+            );
+        });
+    }
+
+    /// Localized name of a firmware concept, from the selector's own variant
+    /// list so page and preview can never disagree about the numbering.
+    fn qube_concept_label(&self, concept: u8) -> String {
+        let key = self
+            .qube_screen_settings
+            .fields
+            .iter()
+            .find(|field| field.qsid == QUBE_SCREEN_CONCEPT_QSID)
+            .and_then(|field| match field.kind {
+                QubeScreenFieldKind::Select { variants } => {
+                    variants.get(concept as usize).copied()
+                }
+                _ => None,
+            });
+        key.map(|key| crate::i18n::tr_catalog(self.app_settings.language, key).to_owned())
+            .unwrap_or_else(|| concept.to_string())
+    }
+
+    /// Snapshot of the settings the preview draws. Values the firmware does not
+    /// expose keep a factory-like default, so the preview always shows a
+    /// complete screen instead of holes.
+    fn qube_preview_data(&self) -> QubePreviewData {
+        let state = &self.qube_screen_settings;
+        let value = |qsid: u16, default: u8| -> u8 {
+            state
+                .values
+                .get(&qsid)
+                .copied()
+                .unwrap_or(u16::from(default))
+                .min(u16::from(u8::MAX)) as u8
+        };
+        let color = |qsids: [u16; 3], default: [u8; 3]| -> Color32 {
+            Color32::from_rgb(
+                value(qsids[0], default[0]),
+                value(qsids[1], default[1]),
+                value(qsids[2], default[2]),
+            )
+        };
+        let accent = color([320, 321, 322], [24, 154, 255]);
+        let battery = self
+            .device_about_info
+            .as_ref()
+            .and_then(|info| info.battery_halves);
+        let bluetooth = self
+            .selected_device
+            .and_then(|index| self.device_manager.devices().get(index))
+            .is_some_and(|device| device.is_bluetooth_transport());
+
+        QubePreviewData {
+            concept: value(QUBE_SCREEN_CONCEPT_QSID, 0),
+            show_wpm: value(216, 1) != 0,
+            show_modifiers: value(219, 1) != 0,
+            show_batteries: value(220, 1) != 0,
+            show_connection: value(221, 1) != 0,
+            header_mode: value(217, 2).min(2),
+            badge_place: value(227, 0).min(1),
+            accent,
+            accent_shadow: color([224, 225, 226], [8, 65, 148]),
+            background: color([330, 331, 332], [0, 8, 33]),
+            panel: color([230, 231, 232], [0, 18, 52]),
+            borders: color([233, 234, 235], [30, 70, 120]),
+            text: color([236, 237, 238], [255, 255, 255]),
+            labels: color([239, 240, 241], [150, 170, 200]),
+            bar: color([242, 243, 244], [24, 154, 255]),
+            warning: color([245, 246, 247], [255, 200, 40]),
+            critical: color([248, 249, 250], [230, 60, 60]),
+            layer_name: self
+                .layer_names
+                .get(self.selected_layer)
+                .cloned()
+                .unwrap_or_default(),
+            layer_index: self.selected_layer,
+            battery_left: battery.and_then(|levels| levels.left).unwrap_or(73),
+            battery_right: battery.and_then(|levels| levels.right).unwrap_or(41),
+            bluetooth,
+        }
     }
 
     fn draw_qube_screen_rows(
@@ -471,6 +631,19 @@ impl EntropyApp {
             == value;
         if !already_requested {
             self.queue_qube_screen_setting_write(label.to_owned(), qsid, confirmed, value);
+        }
+    }
+
+    /// Applies a theme preset: every colour channel the firmware announces is
+    /// queued through the shared write path, so the preview and the device
+    /// update together and single colours stay editable afterwards.
+    fn apply_qube_theme(&mut self, index: usize) {
+        let Some(theme) = QUBE_THEMES.get(index) else {
+            return;
+        };
+        let label = crate::i18n::tr_catalog(self.app_settings.language, theme.label_key).to_owned();
+        for (qsid, value) in theme.writes(&self.supported_qmk_settings) {
+            self.apply_qube_screen_value(qsid, u16::from(value), &label);
         }
     }
 
