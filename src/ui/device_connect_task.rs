@@ -316,6 +316,42 @@ fn normalize_reported_layer_count(reported_layer_count: usize) -> usize {
     reported_layer_count.max(1)
 }
 
+/// A device that answers one raw-HID request per main-loop pass spends tens of
+/// milliseconds on every request: the M4CR0Pad v2 on firmware 4.0.6 needs about
+/// 50 ms, while the K:03 dongle needs about 3 ms. Reading a whole keyboard up
+/// front is a few hundred requests, so such a device would keep the user waiting
+/// for tens of seconds - it gets the staged pipeline Bluetooth already uses.
+const SLOW_DEVICE_REQUEST_MS: u128 = 15;
+const SLOW_DEVICE_PROBES: usize = 3;
+
+/// Median of the probe latencies. A mean would flip on the occasional ~45 ms
+/// answer a fast device gives when the host is busy; the median needs most
+/// samples slow, which is exactly the shape of a firmware that services one
+/// request per loop.
+fn slow_device_latency(samples: &mut [u128]) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    samples.sort_unstable();
+    samples[samples.len() / 2] >= SLOW_DEVICE_REQUEST_MS
+}
+
+/// Times a few cheap, side-effect-free reads to pick the loading strategy.
+/// A failing probe never changes the connect path: the real read that follows
+/// reports the failure properly.
+#[cfg(not(target_arch = "wasm32"))]
+fn device_answers_slowly(dev_conn: &crate::hid::HidDevice) -> bool {
+    let mut samples = Vec::with_capacity(SLOW_DEVICE_PROBES);
+    for _ in 0..SLOW_DEVICE_PROBES {
+        let started = std::time::Instant::now();
+        if dev_conn.get_definition_size().is_err() {
+            return false;
+        }
+        samples.push(started.elapsed().as_millis());
+    }
+    slow_device_latency(&mut samples)
+}
+
 fn use_device_name_for_unnamed_layout(layout: &mut KeyboardLayout, device_name: &str) {
     if layout.name.trim().is_empty() || layout.name.eq_ignore_ascii_case("unknown") {
         let device_name = device_name.trim();
@@ -780,8 +816,6 @@ impl EntropyApp {
                 let dev_conn = opened.map_err(|e| format!("Open failed: {e:#}"))?;
                 let standby_animation_load = Self::device_uses_automatic_display_host_data(&dev)
                     .then(|| dev_conn.pause_standby_animation_for_load());
-                let staged_bluetooth_load = dev_conn.is_bluetooth_transport();
-
                 progress("Reading VIA protocol version…")?;
                 log::info!("Getting protocol version…");
                 let via_protocol = dev_conn
@@ -830,6 +864,13 @@ impl EntropyApp {
                         None
                     }
                 };
+
+                // Bluetooth always stages its load. A device that answers raw-HID
+                // requests slowly gets the same treatment: reading a whole
+                // keyboard up front would keep the user waiting for tens of
+                // seconds (see `device_answers_slowly`).
+                let staged_load =
+                    dev_conn.is_bluetooth_transport() || device_answers_slowly(&dev_conn);
 
                 let supports_application_layouts = if !headless && dev.is_ergohaven_display_macropad() {
                     let supported = dev_conn.supports_application_layout_protocol();
@@ -899,7 +940,7 @@ impl EntropyApp {
                     .or_else(|| firmware_version_from_vial_json(&json));
                 let manufacturer = manufacturer_for_about(&dev.manufacturer, &json);
                 let supports_battery_halves = supports_battery_halves_from_vial_json(&json);
-                let battery_halves = if supports_battery_halves && !staged_bluetooth_load {
+                let battery_halves = if supports_battery_halves && !staged_load {
                     progress("Reading split battery levels…")?;
                     match dev_conn.get_battery_halves() {
                         Ok(levels) => levels,
@@ -977,7 +1018,7 @@ impl EntropyApp {
                     vec![vec![crate::keyboard::KeyBinding::default(); num_keys]; layer_count];
 
                 progress("Reading keymap…")?;
-                let initial_layer_count = if staged_bluetooth_load {
+                let initial_layer_count = if staged_load {
                     1
                 } else {
                     layer_count
@@ -997,7 +1038,7 @@ impl EntropyApp {
                         log::info!("Keymap loaded from buffer");
                     }
                     Err(e) => {
-                        if staged_bluetooth_load {
+                        if staged_load {
                             return Err(format!("Initial Bluetooth layer read failed: {e:#}"));
                         }
                         log::warn!("get_keymap_buffer failed: {e}");
@@ -1083,7 +1124,7 @@ impl EntropyApp {
                     }
                 }
 
-                if staged_bluetooth_load || !has_firmware_layer_names(&layout.layer_names) {
+                if staged_load || !has_firmware_layer_names(&layout.layer_names) {
                     if let Some(local_layer_names) = load_saved_layer_names(&dev.name) {
                         for (layer, name) in
                             local_layer_names.into_iter().enumerate().take(layer_count)
@@ -1095,7 +1136,7 @@ impl EntropyApp {
                     }
                 }
 
-                let layer_name_updates = (!staged_bluetooth_load)
+                let layer_name_updates = (!staged_load)
                     .then(|| {
                         layer_name_sync_updates(
                             &layout.layer_names,
@@ -1162,7 +1203,7 @@ impl EntropyApp {
                         match dev_conn.get_macro_buffer_size() {
                             Ok(size) => {
                                 log::info!("Macro buffer size: {size}");
-                                let macro_texts = if staged_bluetooth_load {
+                                let macro_texts = if staged_load {
                                     vec![Vec::new(); count as usize]
                                 } else {
                                     match dev_conn.get_macro_buffer(size, count) {
@@ -1214,7 +1255,7 @@ impl EntropyApp {
                 };
 
                 progress("Reading combos…")?;
-                let mut combo_entries = if staged_bluetooth_load {
+                let mut combo_entries = if staged_load {
                     vec![ComboEntry::default(); combo_count as usize]
                 } else {
                     let count = combo_count;
@@ -1245,28 +1286,28 @@ impl EntropyApp {
                     entries
                 };
 
-                let behavior_settings = if staged_bluetooth_load {
+                let behavior_settings = if staged_load {
                     BehaviorSettingsState::default()
                 } else {
                     progress("Reading QMK settings values…")?;
                     Self::read_behavior_settings(&supported_qmk_settings, &dev_conn)
                 };
 
-                let touchpad_settings = if staged_bluetooth_load {
+                let touchpad_settings = if staged_load {
                     TouchpadSettingsState::default()
                 } else {
                     Self::read_touchpad_settings(&json, &supported_qmk_settings, &dev_conn)
                 };
 
                 progress("Reading Bluetooth settings…")?;
-                let bluetooth_settings = if staged_bluetooth_load {
+                let bluetooth_settings = if staged_load {
                     BluetoothSettingsState::default()
                 } else {
                     Self::read_bluetooth_settings(&json, &supported_qmk_settings, &dev_conn)
                 };
 
                 progress("Reading module settings…")?;
-                let module_settings = if staged_bluetooth_load {
+                let module_settings = if staged_load {
                     let mut settings =
                         Self::module_settings_from_definition(&json, &supported_qmk_settings);
                     Self::read_initial_module_values(&mut settings, &dev_conn);
@@ -1275,7 +1316,7 @@ impl EntropyApp {
                     Self::read_module_settings(&json, &supported_qmk_settings, &dev_conn)
                 };
 
-                let layer_led_settings = if staged_bluetooth_load {
+                let layer_led_settings = if staged_load {
                     LayerLedSettingsState::default()
                 } else {
                     Self::read_layer_led_settings(
@@ -1286,7 +1327,7 @@ impl EntropyApp {
                     )
                 };
 
-                let rgb_settings = if staged_bluetooth_load {
+                let rgb_settings = if staged_load {
                     RgbSettingsState::default()
                 } else if layer_led_settings.supported && layout.lighting_mode.is_none() {
                     // hpd3-style Ergohaven boards use QMK RGBLight internally only as a
@@ -1314,7 +1355,7 @@ impl EntropyApp {
                     Self::read_qube_screen_settings(&json, &supported_qmk_settings, &dev_conn);
 
                 progress("Reading tap dance entries…")?;
-                let mut tap_dance_entries = if staged_bluetooth_load {
+                let mut tap_dance_entries = if staged_load {
                     vec![crate::keycode_picker::TapDanceEntry::default(); tap_dance_count as usize]
                 } else {
                     let count = tap_dance_count;
@@ -1340,7 +1381,7 @@ impl EntropyApp {
                     entries
                 };
 
-                if !staged_bluetooth_load
+                if !staged_load
                     && (supports_rmk_native_combo_output || supports_rmk_native_tap_dance_actions)
                 {
                     let native_actions = dev_conn
@@ -1361,7 +1402,7 @@ impl EntropyApp {
                 }
 
                 progress("Reading key overrides…")?;
-                let key_override_entries = if staged_bluetooth_load {
+                let key_override_entries = if staged_load {
                     vec![KeyOverrideEntry::default(); key_override_count as usize]
                 } else {
                     let count = key_override_count;
@@ -1397,7 +1438,7 @@ impl EntropyApp {
                     entries
                 };
 
-                let alt_repeat_entries = if staged_bluetooth_load {
+                let alt_repeat_entries = if staged_load {
                     vec![AltRepeatKeyEntry::default(); reported_alt_repeat_count as usize]
                 } else {
                     let count = reported_alt_repeat_count;
@@ -1431,7 +1472,7 @@ impl EntropyApp {
                     &json,
                     rmk_native_capabilities.vial_macro_ext,
                 );
-                let deferred_load = if staged_bluetooth_load {
+                let deferred_load = if staged_load {
                     let definition_fingerprint = vial_definition_fingerprint(&json)
                         .map_err(|error| format!("Layout fingerprint failed: {error}"))?;
                     let modules_supported = module_settings.supported;
@@ -2196,5 +2237,22 @@ mod tests {
         let context = cache_context(&serde_json::json!({"settings": [120]}));
 
         assert_eq!(parse_cached_qmk_settings("[120,121]", &context), None);
+    }
+
+    #[test]
+    fn slow_device_latency_uses_the_median_of_the_probes() {
+        // The K:03 dongle answers in ~3 ms, the M4CR0Pad v2 in ~50 ms.
+        assert!(!slow_device_latency(&mut [3, 2, 4]));
+        assert!(slow_device_latency(&mut [50, 52, 49]));
+
+        // One scheduling hiccup must not stage the load ...
+        assert!(!slow_device_latency(&mut [47, 3, 3]));
+        // ... and one fast answer must not un-stage a slow device.
+        assert!(slow_device_latency(&mut [12, 51, 50]));
+
+        // The boundary is inclusive, and an empty probe set never stages.
+        assert!(slow_device_latency(&mut [SLOW_DEVICE_REQUEST_MS]));
+        assert!(!slow_device_latency(&mut [SLOW_DEVICE_REQUEST_MS - 1]));
+        assert!(!slow_device_latency(&mut []));
     }
 }
