@@ -309,11 +309,23 @@ pub(crate) fn paint_qube_screen_preview(
     let scale = screen.width() / SCREEN_WIDTH;
     let painter = ui.painter();
 
+    // The dongle has no screen bezel: the panel shows the background colour all
+    // the way to the edge. A stroke here would put the frame colour on glass
+    // where the firmware never draws it.
+    //
+    // The terminal screen is the one concept that clears to pure black
+    // (`C_BLACK`), which the palette post-pass leaves untouched - so it must not
+    // be cleared with the configured background colour.
+    let screen_fill = if data.concept == 2 {
+        Color32::BLACK
+    } else {
+        data.background
+    };
     painter.rect(
         screen,
         6.0 * scale,
-        data.background,
-        Stroke::new(1.0_f32, data.borders),
+        screen_fill,
+        Stroke::NONE,
         egui::StrokeKind::Inside,
     );
 
@@ -348,8 +360,19 @@ pub(crate) fn paint_qube_screen_preview(
     let fill = |r: egui::Rect, color: Color32| {
         painter.rect_filled(r, 2.0 * scale, color);
     };
+    let shades = data.shades();
     let bar = |r: egui::Rect, fraction: f32, color: Color32| {
-        fill(r, data.panel);
+        // Track of a progress bar. The dashboard battery card fills it with
+        // `COL_BAR_BG` (`bar_bg`, one step off the panel shade) and every concept
+        // bar is drawn by `cbar`, which fills with `COL_PANEL_HI` (`panel_hi`).
+        // The media centre has no bar at all on the dongle (the footer prints
+        // the percentages as text), so its preview bars sit on the background.
+        let track = match data.concept {
+            0 => shades.bar_bg,
+            12 => data.background,
+            _ => shades.panel_hi,
+        };
+        fill(r, track);
         let fraction = fraction.clamp(0.0, 1.0);
         if fraction > 0.0 {
             fill(
@@ -358,16 +381,48 @@ pub(crate) fn paint_qube_screen_preview(
             );
         }
     };
-    // Green below the yellow threshold, amber between, red above - the zones the
-    // firmware paints on its speed bars.
-    let zone_color = |fraction: f32| -> Color32 {
-        if fraction >= 0.9 {
-            data.critical
-        } else if fraction >= 0.6 {
-            data.warning
+    // Battery zones of the firmware (`battery_color`): red below 10 %, yellow
+    // below 25 %, otherwise the "good" colour - `C_OK` (`battery_ok`) on the
+    // dashboard and on concepts 1..10, `COL_BAR_FG` (`bar`) on the round-two
+    // screens 11..13.
+    let battery_color = |value: u8| -> Color32 {
+        if value < 10 {
+            shades.bad
+        } else if value < 25 {
+            shades.warn
         } else {
-            data.bar
+            shades.battery_ok
         }
+    };
+    let bar_battery_color = |value: u8| -> Color32 {
+        if value < 10 {
+            shades.bad
+        } else if value < 25 {
+            shades.warn
+        } else {
+            shades.bar
+        }
+    };
+    // Segmented speed scale of the speedometer: green below 60 % of the scale,
+    // yellow below 85 %, red above (the thresholds `render_concept_speedo` uses).
+    let scale_color = |fraction: f32| -> Color32 {
+        if fraction < 0.6 {
+            shades.battery_ok
+        } else if fraction < 0.85 {
+            shades.warn
+        } else {
+            shades.bad
+        }
+    };
+    // Connection badge: the firmware paints `COL_OUTPUT_OK` (green, derived from
+    // the bar colour) while a transport is up and `COL_OUTPUT_SEARCH` (blue,
+    // derived from the accent) while it is pairing or reconnecting - the preview
+    // showed the plain bar colour here, which is why a theme looked different on
+    // the dongle.
+    let link_color = if data.bluetooth {
+        shades.output_search
+    } else {
+        shades.output_ok
     };
     let wpm_fraction = f32::from(PREVIEW_WPM) / WPM_SCALE_MAX;
     let layer = data.layer_label();
@@ -412,7 +467,7 @@ pub(crate) fn paint_qube_screen_preview(
             }
             if data.show_connection {
                 panel(rect(screen, 14.0, 196.0, 92.0, 22.0));
-                fill(rect(screen, 20.0, 204.0, 6.0, 6.0), data.bar);
+                fill(rect(screen, 20.0, 204.0, 6.0, 6.0), link_color);
                 text_at(
                     32.0,
                     207.0,
@@ -425,7 +480,12 @@ pub(crate) fn paint_qube_screen_preview(
         }
         // Terminal: phosphor status lines in a monospaced frame.
         2 => {
-            let phosphor = Color32::from_rgb(0x3D, 0xF0, 0x6A);
+            // `render_concept_terminal` clears to `C_BLACK` - which the palette
+            // post-pass leaves alone - and draws with `C_TERM`, the phosphor
+            // green derived from the bar colour (`terminal`). The preview used a
+            // fixed RGB constant here, so the terminal screen kept its green
+            // look while the rest of the theme changed.
+            let phosphor = shades.terminal;
             painter.rect_filled(screen, 6.0 * scale, Color32::BLACK);
             painter.rect_stroke(
                 rect(screen, 6.0, 6.0, 268.0, 228.0),
@@ -504,7 +564,7 @@ pub(crate) fn paint_qube_screen_preview(
                 );
             }
             if data.show_connection {
-                fill(rect(screen, 14.0, 166.0, 6.0, 6.0), data.bar);
+                fill(rect(screen, 14.0, 166.0, 6.0, 6.0), link_color);
                 text_at(
                     26.0,
                     169.0,
@@ -535,7 +595,7 @@ pub(crate) fn paint_qube_screen_preview(
                     bar(
                         rect(screen, 168.0, y - 5.0, 70.0, 9.0),
                         f32::from(value) / 100.0,
-                        data.bar,
+                        battery_color(value),
                     );
                     text_at(
                         266.0,
@@ -552,7 +612,7 @@ pub(crate) fn paint_qube_screen_preview(
         5 => {
             text_at(140.0, 20.0, &layer, 11.0, data.text, egui::Align2::CENTER_CENTER);
             if data.show_connection {
-                fill(rect(screen, 12.0, 20.0, 6.0, 6.0), data.bar);
+                fill(rect(screen, 12.0, 20.0, 6.0, 6.0), link_color);
                 text_at(
                     26.0,
                     23.0,
@@ -567,12 +627,12 @@ pub(crate) fn paint_qube_screen_preview(
             if data.show_wpm {
                 for index in 0..20 {
                     let start = index as f32 / 20.0;
-                    let color = zone_color(start);
+                    let color = scale_color(start);
                     let x = 40.0 + index as f32 * 7.0;
                     let filled = start <= wpm_fraction;
                     fill(
                         rect(screen, x, 108.0, 6.0, 10.0),
-                        if filled { color } else { data.panel },
+                        if filled { color } else { shades.panel_hi },
                     );
                 }
                 text_at(40.0, 124.0, "0", 7.0, data.labels, egui::Align2::LEFT_CENTER);
@@ -616,7 +676,7 @@ pub(crate) fn paint_qube_screen_preview(
                 text_at(x, 152.0, value, 7.0, data.labels, egui::Align2::LEFT_CENTER);
             }
             if data.show_connection {
-                fill(rect(screen, 20.0, 178.0, 6.0, 6.0), data.bar);
+                fill(rect(screen, 20.0, 178.0, 6.0, 6.0), link_color);
                 text_at(
                     32.0,
                     181.0,
@@ -665,7 +725,7 @@ pub(crate) fn paint_qube_screen_preview(
             }
             text_at(12.0, 206.0, "09:41", 10.0, data.labels, egui::Align2::LEFT_CENTER);
             if data.show_connection {
-                fill(rect(screen, 150.0, 34.0, 6.0, 6.0), data.bar);
+                fill(rect(screen, 150.0, 34.0, 6.0, 6.0), link_color);
                 text_at(
                     162.0,
                     37.0,
@@ -697,7 +757,7 @@ pub(crate) fn paint_qube_screen_preview(
                     bar(
                         rect(screen, 150.0, y + 8.0, 118.0, 8.0),
                         f32::from(value) / 100.0,
-                        data.bar,
+                        battery_color(value),
                     );
                     text_at(
                         268.0,
@@ -729,9 +789,18 @@ pub(crate) fn paint_qube_screen_preview(
                 let fraction = 0.25 + 0.75 * (index as f32 / 23.0);
                 let height = 90.0 * fraction;
                 let x = 12.0 + index as f32 * 10.8;
+                // The firmware colours the newest bar with the accent, the
+                // loud ones yellow and the rest with the raised panel shade.
+                let color = if index + 1 == 24 {
+                    data.accent
+                } else if fraction > 0.8 {
+                    shades.warn
+                } else {
+                    shades.panel_hi
+                };
                 fill(
                     rect(screen, x, 142.0 - height, 8.0, height),
-                    zone_color(fraction),
+                    color,
                 );
             }
             text_at(12.0, 178.0, "0", 7.0, data.labels, egui::Align2::LEFT_CENTER);
@@ -774,7 +843,7 @@ pub(crate) fn paint_qube_screen_preview(
                     46.0,
                     data.connection_label(),
                     26.0,
-                    data.bar,
+                    link_color,
                     egui::Align2::LEFT_CENTER,
                 );
                 text_at(
@@ -790,7 +859,11 @@ pub(crate) fn paint_qube_screen_preview(
                 let height = 14.0 + index as f32 * 12.0;
                 fill(
                     rect(screen, 196.0 + index as f32 * 18.0, 60.0 - height + 14.0, 14.0, height),
-                    if index < 3 { data.bar } else { data.panel },
+                    if index < 3 {
+                        shades.battery_ok
+                    } else {
+                        shades.panel_hi
+                    },
                 );
             }
             text_at(12.0, 116.0, "PROFILE", 7.0, data.labels, egui::Align2::LEFT_CENTER);
@@ -820,7 +893,7 @@ pub(crate) fn paint_qube_screen_preview(
                     bar(
                         rect(screen, x + 12.0, 171.0, 72.0, 9.0),
                         f32::from(value) / 100.0,
-                        data.bar,
+                        battery_color(value),
                     );
                 }
             }
@@ -839,7 +912,7 @@ pub(crate) fn paint_qube_screen_preview(
                 centered(150.0, &format!("{PREVIEW_WPM} wpm"), 9.0, data.labels);
             }
             if data.show_connection {
-                centered(176.0, data.connection_label(), 9.0, data.bar);
+                centered(176.0, data.connection_label(), 9.0, link_color);
             }
             text_at(268.0, 212.0, "09:41", 8.0, data.labels, egui::Align2::RIGHT_CENTER);
         }
@@ -873,7 +946,7 @@ pub(crate) fn paint_qube_screen_preview(
                 for segment in 0..segments {
                     let filled = f32::from(value) / 100.0 > segment as f32 / segments as f32;
                     let color = if filled {
-                        zone_color(f32::from(value) / 100.0)
+                        bar_battery_color(value)
                     } else {
                         data.background
                     };
@@ -903,7 +976,7 @@ pub(crate) fn paint_qube_screen_preview(
                 );
             }
             if data.show_connection {
-                fill(rect(screen, 12.0, 208.0, 6.0, 6.0), data.bar);
+                fill(rect(screen, 12.0, 208.0, 6.0, 6.0), link_color);
                 text_at(
                     24.0,
                     211.0,
@@ -917,11 +990,14 @@ pub(crate) fn paint_qube_screen_preview(
         }
         // Mediacenter: what is playing is the screen.
         12 => {
-            panel(rect(screen, 8.0, 8.0, 264.0, 92.0));
+            // `render_concept_mediacenter` fills no card and draws no progress
+            // bar (the host protocol carries no track position); it only rules a
+            // line under the block with `C_BORDER`. The preview filled both with
+            // the panel colour, which the dongle never puts on this screen.
+            fill(rect(screen, 8.0, 92.0, 264.0, 1.0), data.borders);
             text_at(16.0, 24.0, "NOW PLAYING", 7.0, data.labels, egui::Align2::LEFT_CENTER);
             text_at(16.0, 46.0, "Boards of Canada", 15.0, data.text, egui::Align2::LEFT_CENTER);
             text_at(16.0, 68.0, "Roygbiv", 11.0, data.accent, egui::Align2::LEFT_CENTER);
-            bar(rect(screen, 16.0, 84.0, 248.0, 6.0), 0.42, data.bar);
             text_at(16.0, 112.0, "01:12", 8.0, data.labels, egui::Align2::LEFT_CENTER);
             text_at(264.0, 112.0, "-01:41", 8.0, data.labels, egui::Align2::RIGHT_CENTER);
             text_at(140.0, 128.0, "VOL  42", 9.0, data.labels, egui::Align2::CENTER_CENTER);
@@ -937,8 +1013,9 @@ pub(crate) fn paint_qube_screen_preview(
                 );
             }
             if data.show_connection {
-                panel(rect(screen, 12.0, 176.0, 74.0, 22.0));
-                fill(rect(screen, 18.0, 184.0, 6.0, 6.0), data.bar);
+                // `pbadge` of the media centre is a bare dot plus the badge text
+                // (no card), so the preview must not wrap it in a panel.
+                fill(rect(screen, 18.0, 184.0, 6.0, 6.0), link_color);
                 text_at(
                     30.0,
                     187.0,
@@ -1019,7 +1096,7 @@ pub(crate) fn paint_qube_screen_preview(
             text_at(176.0, 60.0, "Roygbiv", 8.0, data.accent, egui::Align2::LEFT_CENTER);
             bar(rect(screen, 176.0, 76.0, 86.0, 5.0), 0.42, data.bar);
             if data.show_connection {
-                fill(rect(screen, 176.0, 92.0, 6.0, 6.0), data.bar);
+                fill(rect(screen, 176.0, 92.0, 6.0, 6.0), link_color);
                 text_at(
                     188.0,
                     95.0,
@@ -1074,7 +1151,7 @@ pub(crate) fn paint_qube_screen_preview(
             let mut header_right = 268.0;
             if data.show_connection && badge_in_header {
                 panel(rect(screen, 208.0, 10.0, 60.0, 20.0));
-                fill(rect(screen, 214.0, 17.0, 6.0, 6.0), data.bar);
+                fill(rect(screen, 214.0, 17.0, 6.0, 6.0), link_color);
                 text_at(
                     226.0,
                     20.0,
@@ -1147,7 +1224,7 @@ pub(crate) fn paint_qube_screen_preview(
                     bar(
                         rect(screen, x + 10.0, 176.0, 106.0, 12.0),
                         f32::from(value) / 100.0,
-                        zone_color(f32::from(value) / 100.0),
+                        bar_battery_color(value),
                     );
                 }
             }
@@ -1165,13 +1242,9 @@ pub(crate) fn paint_qube_screen_preview(
         }
     }
 
-    // Accent shadow: a soft band under the layer word, as on the real screen.
-    if data.concept != 2 {
-        fill(
-            rect(screen, 0.0, SCREEN_HEIGHT - 3.0, SCREEN_WIDTH, 3.0),
-            data.accent_shadow,
-        );
-    }
+    // The firmware spends `accent_dim` only on the dashboard (the shadow under
+    // the layer word and the fill of an active modifier chip); there is no
+    // bottom band on any concept screen, so the preview must not invent one.
 }
 
 #[cfg(test)]
@@ -1295,7 +1368,7 @@ mod tests {
 
     #[test]
     fn every_concept_paints_a_distinct_frame() {
-        let mut signatures: Vec<(usize, usize, usize)> = Vec::new();
+        let mut signatures: Vec<(usize, usize, u64)> = Vec::new();
         for concept in 0..14u8 {
             let frame = paint(&sample(concept));
             assert!(
@@ -1304,15 +1377,23 @@ mod tests {
                 frame.text
             );
             assert!(
-                // Every frame paints at least the screen background and the
-                // accent band; the text-only concepts add nothing else.
-                frame.rects >= 2,
+                // Every frame paints at least the screen background; concepts
+                // that show nothing but text add no other shape (the dongle has
+                // neither a bezel nor a bottom band, so the preview has none).
+                frame.rects >= 1,
                 "concept {concept} painted only {} shapes",
                 frame.rects
             );
-            // Text lines, painted rectangles and filled shapes: three numbers
-            // that differ as soon as a concept lays its elements out differently.
-            signatures.push((frame.text.len(), frame.rects, frame.fills.len()));
+            // Text lines, painted rectangles and a hash of the paint colours in
+            // order: three numbers that differ as soon as a concept lays its
+            // elements out differently or colours them differently.
+            let mut fingerprint: u64 = 0xcbf2_9ce4_8422_2325;
+            for fill in &frame.fills {
+                for byte in fill.to_srgba_unmultiplied() {
+                    fingerprint = (fingerprint ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3);
+                }
+            }
+            signatures.push((frame.text.len(), frame.rects, fingerprint));
         }
         let unique: std::collections::HashSet<_> = signatures.iter().collect();
         assert_eq!(
@@ -1358,24 +1439,26 @@ mod tests {
 
     #[test]
     fn colors_reach_the_frame() {
-        // The sparkline paints the whole scale, so all three zones show up; the
-        // speedo only colours the part below the current speed.
+        // The sparkline paints every zone: the newest bar in the accent, the
+        // loud ones in the warning colour and the rest in the raised panel
+        // shade the firmware's `C_PANEL_HI` becomes.
         let mut data = sample(8);
-        data.bar = Color32::from_rgb(1, 2, 3);
-        data.warning = Color32::from_rgb(4, 5, 6);
-        data.critical = Color32::from_rgb(7, 8, 9);
+        data.accent = Color32::from_rgb(1, 2, 3);
+        data.warning = Color32::from_rgb(255, 0, 0);
+        data.panel = Color32::from_rgb(0, 0, 255);
+        let shades = data.shades();
         let frame = paint(&data);
         assert!(
             frame.fills.contains(&Color32::from_rgb(1, 2, 3)),
-            "the bar colour must be painted"
+            "the accent colour must be painted"
         );
         assert!(
-            frame.fills.contains(&Color32::from_rgb(4, 5, 6)),
+            frame.fills.contains(&shades.warn),
             "the threshold colour must be painted"
         );
         assert!(
-            frame.fills.contains(&Color32::from_rgb(7, 8, 9)),
-            "the critical colour must be painted"
+            frame.fills.contains(&shades.panel_hi),
+            "the raised panel shade must be painted"
         );
     }
 
@@ -1689,3 +1772,532 @@ impl QubePreviewData {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Firmware parity harness
+// ---------------------------------------------------------------------------
+//
+// The stand `work/concepts-stand` compiles the *shipped* firmware file
+// (`work/my-config/rmk-qube/qube_display.rs`) against host stubs and can dump
+// one raw RGB565 frame per (concept, theme) together with its SHA-256
+// (`--goldens <dir>`). The module below renders the app preview headlessly,
+// converts it to the same RGB565 byte image and compares:
+//
+// * `preview_paints_only_firmware_roles` — enforced: every colour the preview
+//   asks the painter for must be a colour the firmware really puts on the glass
+//   for that screen and palette. This is the check that catches "the preview
+//   uses the base colour where the dongle uses a derived shade", which is what
+//   the user sees when a theme looks different on the dongle.
+// * `golden_frame_parity_report` — diagnostic: the byte-for-byte delta against
+//   the firmware frame, with a diff PNG. It prints the table and never fails on
+//   the delta, because the preview is a *stylised* redraw (Montserrat text and
+//   its own coordinates) and cannot be pixel-equal until it is ported to the
+//   firmware's FONT_6X10 / FONT_8X13 / FONT_10X20 rasteriser and layout.
+#[cfg(test)]
+mod firmware_parity {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// `outputs\entropy-qube\goldens` — raw frames and the hash table written by
+    /// `qube-concepts-stand --goldens <dir>`.
+    const GOLDEN_DIR: &str =
+        r"C:\Users\Ilya\Documents\Codex\2026-10-06\g\outputs\entropy-qube\goldens";
+    /// Diff images of the diagnostic report.
+    const DIFF_DIR: &str =
+        r"C:\Users\Ilya\Documents\Codex\2026-10-06\g\outputs\screen-preview\diff";
+
+    /// `(concept, theme slug, SHA-256 of the raw little-endian RGB565 frame)`
+    /// for the parity state (layer 0 "Base", 68 WPM, 73 %/41 %, USB, 09:41,
+    /// "Boards of Canada - Roygbiv"). Generated by the stand.
+    const GOLDENS: [(u8, &str, &str); 56] = [
+        (0, "dark", "d3c4df09ebd675de1951e39bd5669e6bc857ad9f10434600c14b6ac9769f497a"),
+        (1, "dark", "1d936a56be283f1a5c84d7abba846f2c77426b8ed44f810f295ff6b566e50e54"),
+        (2, "dark", "390443d1f9d05d6dd606f38a20e43729763aa3dc5cef78ed40286e1ce04bcadb"),
+        (3, "dark", "3e6629e2caa5c0111c238752c25941b8d1064c5ded9042a3a795bfb3b4048c70"),
+        (4, "dark", "b46ae27036574a0c5ebd4e443e9eeef88d73eee4c84f0011b6e96359becebb1f"),
+        (5, "dark", "cf84198ea6760f1dc9f81152452d935f13f15e9d1476b91856888ebf63c8af2f"),
+        (6, "dark", "3f21c86ed7c5b872e5a748018e02813b655a31c3ee8c1e67279c70af99b8a63c"),
+        (7, "dark", "c2257531db624b2cd8c14d0c991bd452aaf71e6cc2843de40f706fe74f40ed71"),
+        (8, "dark", "a3ab3c9f95b6205735133d382123fe2e53b1715d2201885f7d6938606a91c59f"),
+        (9, "dark", "46197435bcc6976f2cf9553a80f684f1734c69a2f2ad39b3e9932ac6ceda6916"),
+        (10, "dark", "5f71e6932b1c157aa3949ad935cfc27873c17bac1e75a2cbbd72a2be7718bf9d"),
+        (11, "dark", "14abbdd395c80d5453353ad27d02871c69cfa8355e48be4f8ae2ec4e8fa96914"),
+        (12, "dark", "adf81bce0a7fd804761558cd8453f451a81902d7167c11c8384070012ee6e798"),
+        (13, "dark", "fb3b3766f1f162e40577836666d662c56a9aeab7797938a0375328e45053456a"),
+        (0, "light", "ea841baeef964429bca27a6f766b943d3d606525e9427cde1b38e3aeafceac3c"),
+        (1, "light", "4c43825f539722c2ffb96c9c79cd6ec7053552478b7a819b187a7af1bd045615"),
+        (2, "light", "0156a5035846b0c878659abf7034aacdfa740e2ba0d9a98bc16016ad11c3d75f"),
+        (3, "light", "a767ca078188b08aac12979279cf73bd799e49132846a60015fe3ebd2480ddae"),
+        (4, "light", "5b67282b8d383a86bd8ecec63ba5085c9fead12fcd3b7e78608bb6de47d9c6ad"),
+        (5, "light", "8713e2fa30d7ea4695bf967ceaa3c77e4ee32246d86ea57d1848214254250afd"),
+        (6, "light", "20640f2c5ce54ee32372307f2fe8fbeffb05a0ca7600750abe9f6f1314ab696b"),
+        (7, "light", "d2b213364c3dab819647d215ebc1505c1959f6eb04430822aa3eaefa6ca28133"),
+        (8, "light", "8991d57419064fb09168beaa58801e83c03659dc903e5bce20130d5a6834fe3c"),
+        (9, "light", "d2d40ac4f0d005e5652efe499c6569cd595520b6808b028a594c59ada4db4db0"),
+        (10, "light", "fcf7e1456bc7517a8102969d30e928fac7f7336f874818d69a96c69ce58c03aa"),
+        (11, "light", "ab69bafb06eb218c53088adf6396ae25e0b7a0664bc9f7def7c0a5967b3250ad"),
+        (12, "light", "540d3b2a098f6a31ca3822c1a74b27d9b4b758540174384dd8fa7ebd6d80879d"),
+        (13, "light", "e4f3e865e915b4306c3e2747a2e29f4dbc38f68b5fc3a2cdf5407ad87c728789"),
+        (0, "phosphor", "6b207d8c2c937db297880469dbffc6cb9aeff27c94ab386817fd6c1844001e67"),
+        (1, "phosphor", "a8bc143e2cfbac2de05a39f1de3dfa7ac7f7ce3d7eaff773e60b3cf0d5b38b94"),
+        (2, "phosphor", "b5efea83154b7dc28b314a51a94e5b082762ed41b31a782458625cb1cc757715"),
+        (3, "phosphor", "9629fa867644dcae99d82ed72a23dce4a9c9b50ba13e977445556ce00b362e3a"),
+        (4, "phosphor", "b4eb0e2f715123ea9d54ae0558b48169ef033e195226f06c0af028cd165330d6"),
+        (5, "phosphor", "5f448ea23c5594efb0073c9ba321b0ab25b52855eaab27a376ed9a7c087527bf"),
+        (6, "phosphor", "170b6d9b342d2437f68974327d72b63270e8e69971898178b1857bd9847d49b0"),
+        (7, "phosphor", "81149cdb5c01b436bdbb4790fb2623bc98941af7126823e73dad3903f9e2be46"),
+        (8, "phosphor", "a4b9b67f6920dca2e9ed753e1722f3109ea82da7e6e5651b98145505fe5dc9b5"),
+        (9, "phosphor", "2904195bde35d7cacf23ca6f5958cc48dcd06232e3231e59d1c127a417f82df9"),
+        (10, "phosphor", "db38816774cfe73409f4a4ce07bcce414e738a4af0e37fe0bab830081b16dc77"),
+        (11, "phosphor", "03482c1e01f6b4acf662f93a24fead252676dd83c76f61d61fd3ff970aff0c34"),
+        (12, "phosphor", "0febbc5552b92d0671f651b7fb985fb3241509abba2b887f52494a5f40fc4195"),
+        (13, "phosphor", "f8a4476ecab402577a24152adf7f60919784d6b071d43ff1a031fd015f967101"),
+        (0, "amber", "3c059dabd393b41d8bbda4bdc07e07631f4349da989bc0bb6e9e97afc308ef6d"),
+        (1, "amber", "fc9cb1f30610905f5e056bc9893197e28cc3cf9c2fb8f0b78f8aa781897402ad"),
+        (2, "amber", "2be61abe99170b3c6367171419a1fd63e13e2d7bd4e34aa586f444cf8f007d36"),
+        (3, "amber", "625dbbc2be51dc2b9a735d9b0c7652377320efa04d59066d04244fdb05e9a455"),
+        (4, "amber", "6b7e480c1e4f07c871d2faa0937ca99d5f6fa10d280e0ef2f7c0a3a770de79ad"),
+        (5, "amber", "66ab878c820cb10161e8d182a04a3ec375df268243c9e9ba5372237cf7ef5604"),
+        (6, "amber", "43eba33da6466f811230f008956545d2c4bea7f21ea32c03fb80cd570b350f44"),
+        (7, "amber", "cd5c5ef43a2baafbee8b4132c83d5649facfe40bb0cb0f771bb75d99709d51e7"),
+        (8, "amber", "845fae64f86b75aa877f6d5dfee9fd10a018f0e3f70039d9aaacfa2b44717721"),
+        (9, "amber", "3e3adbb253465573b970ad4b4c694f76eb0a20876f0319f86943a2890e95809e"),
+        (10, "amber", "398394f53231bb53035fc16003a8a9d20b2f5e6d74ef6d19baa177d7af11f9ef"),
+        (11, "amber", "dbf7cc30557f6219ce5509cec24b226443316080028f1745871e9fcfb50d016a"),
+        (12, "amber", "db1cd94894300f68c45adcf58d61875d45786184866a26a8b30d096516aeed2f"),
+        (13, "amber", "5e18a26f5d74770c0672e4e5cd605da365a5265aeafa092809a3f393cfc92320"),
+    ];
+
+    /// Theme order of `QUBE_THEMES`, with the slug the golden files use.
+    const THEME_SLUGS: [&str; 4] = ["dark", "light", "phosphor", "amber"];
+
+    fn clamp_byte(value: i32) -> u8 {
+        value.clamp(0, 255) as u8
+    }
+
+    /// Colour a vertex asks for, straight (non-premultiplied) eight-bit RGB.
+    fn vertex_rgb(color: Color32) -> [u8; 3] {
+        let [r, g, b, _] = color.to_srgba_unmultiplied();
+        [r, g, b]
+    }
+
+    /// The preview data the app builds after writing `theme`: every channel is
+    /// quantised to RGB565, which is what the device reads back.
+    fn data_for(concept: u8, theme: &QubeThemePalette) -> QubePreviewData {
+        let colour = |triple: [u8; 3]| {
+            Color32::from_rgb(
+                five_six_five_channel(0, triple[0]),
+                five_six_five_channel(1, triple[1]),
+                five_six_five_channel(2, triple[2]),
+            )
+        };
+        QubePreviewData {
+            concept,
+            show_wpm: true,
+            show_modifiers: true,
+            show_batteries: true,
+            show_connection: true,
+            header_mode: 2,
+            badge_place: 0,
+            accent: colour(theme.accent),
+            accent_shadow: colour(theme.accent_shadow),
+            background: colour(theme.background),
+            panel: colour(theme.panel),
+            borders: colour(theme.borders),
+            text: colour(theme.text),
+            labels: colour(theme.labels),
+            bar: colour(theme.bar),
+            warning: colour(theme.warning),
+            critical: colour(theme.critical),
+            layer_name: "Base".to_owned(),
+            layer_index: 0,
+            battery_left: 73,
+            battery_right: 41,
+            bluetooth: false,
+        }
+    }
+
+    /// Headless 280×240 render of the preview plus the set of colours the
+    /// painter was asked to draw with.
+    struct Rendered {
+        rgb: Vec<[u8; 3]>,
+        requested: BTreeSet<[u8; 3]>,
+    }
+
+    fn render_preview(data: &QubePreviewData) -> Rendered {
+        let ctx = context();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(SCREEN_WIDTH, SCREEN_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            let screen =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SCREEN_WIDTH, SCREEN_HEIGHT));
+            paint_qube_screen_preview(ui, screen, data);
+        });
+        let primitives = ctx.tessellate(output.shapes, 1.0);
+        let atlas = ctx.fonts(|fonts| fonts.image());
+
+        let width = SCREEN_WIDTH as usize;
+        let height = SCREEN_HEIGHT as usize;
+        let mut canvas = vec![Color32::TRANSPARENT; width * height];
+        let mut requested = BTreeSet::new();
+        for clipped in &primitives {
+            let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive else {
+                continue;
+            };
+            for vertex in &mesh.vertices {
+                requested.insert(vertex_rgb(vertex.color));
+            }
+            for triangle in mesh.indices.chunks_exact(3) {
+                paint_triangle(&mut canvas, &atlas, mesh, clipped.clip_rect, triangle);
+            }
+        }
+
+        let rgb = canvas
+            .iter()
+            .map(|colour| {
+                let [r, g, b, _] = colour.to_srgba_unmultiplied();
+                [r, g, b]
+            })
+            .collect();
+        Rendered { rgb, requested }
+    }
+
+    /// One textured triangle of the tessellated preview, sampled the way the
+    /// shader would: the atlas holds white with coverage in alpha, so the vertex
+    /// colour scaled by that coverage is composited over the canvas.
+    fn paint_triangle(
+        canvas: &mut [Color32],
+        atlas: &egui::ColorImage,
+        mesh: &egui::Mesh,
+        clip: egui::Rect,
+        triangle: &[u32],
+    ) {
+        let vertex = |index: u32| mesh.vertices[index as usize];
+        let (a, b, c) = (
+            vertex(triangle[0]),
+            vertex(triangle[1]),
+            vertex(triangle[2]),
+        );
+        let area = edge(a.pos, b.pos, c.pos);
+        if area == 0.0 {
+            return;
+        }
+        let width = SCREEN_WIDTH as usize;
+        let height = SCREEN_HEIGHT as usize;
+        let (atlas_w, atlas_h) = (atlas.size[0], atlas.size[1]);
+
+        let min_x = a.pos.x.min(b.pos.x).min(c.pos.x).max(clip.min.x).max(0.0);
+        let max_x = a.pos.x.max(b.pos.x).max(c.pos.x).min(clip.max.x);
+        let min_y = a.pos.y.min(b.pos.y).min(c.pos.y).max(clip.min.y).max(0.0);
+        let max_y = a.pos.y.max(b.pos.y).max(c.pos.y).min(clip.max.y);
+        let x0 = min_x.floor().max(0.0) as usize;
+        let x1 = (max_x.ceil() as usize).min(width);
+        let y0 = min_y.floor().max(0.0) as usize;
+        let y1 = (max_y.ceil() as usize).min(height);
+
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let point = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
+                let mut w0 = edge(b.pos, c.pos, point) / area;
+                let mut w1 = edge(c.pos, a.pos, point) / area;
+                let mut w2 = edge(a.pos, b.pos, point) / area;
+                if area < 0.0 {
+                    w0 = -w0;
+                    w1 = -w1;
+                    w2 = -w2;
+                }
+                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
+                    continue;
+                }
+                let uv = egui::pos2(
+                    w0 * a.uv.x + w1 * b.uv.x + w2 * c.uv.x,
+                    w0 * a.uv.y + w1 * b.uv.y + w2 * c.uv.y,
+                );
+                let tx = ((uv.x * atlas_w as f32) as isize).clamp(0, atlas_w as isize - 1) as usize;
+                let ty = ((uv.y * atlas_h as f32) as isize).clamp(0, atlas_h as isize - 1) as usize;
+                let coverage = u32::from(atlas.pixels[ty * atlas_w + tx].a());
+                if coverage == 0 {
+                    continue;
+                }
+                let source = a.color;
+                let scale = |channel: u8| u32::from(channel) * coverage / 255;
+                let sr = scale(source.r());
+                let sg = scale(source.g());
+                let sb = scale(source.b());
+                let sa = scale(source.a());
+                let dst = canvas[y * width + x];
+                let inverse = 255 - sa;
+                let mix = |d: u8, s: u32| clamp_byte((u32::from(d) * inverse / 255) as i32 + s as i32);
+                canvas[y * width + x] = Color32::from_rgba_premultiplied(
+                    mix(dst.r(), sr),
+                    mix(dst.g(), sg),
+                    mix(dst.b(), sb),
+                    clamp_byte((u32::from(dst.a()) * inverse / 255) as i32 + sa as i32),
+                );
+            }
+        }
+    }
+
+    fn edge(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
+        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+    }
+
+    /// Raw little-endian RGB565 byte image, the form the goldens hash.
+    fn rgb565_bytes(rgb: &[[u8; 3]]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(rgb.len() * 2);
+        for pixel in rgb {
+            let word = (u16::from(pixel[0] >> 3) << 11)
+                | (u16::from(pixel[1] >> 2) << 5)
+                | u16::from(pixel[2] >> 3);
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out
+    }
+
+    /// Eight-bit expansion of a frame the firmware wrote in RGB565.
+    fn expand565(raw: &[u8]) -> Vec<[u8; 3]> {
+        raw.chunks_exact(2)
+            .map(|pair| {
+                let word = u16::from_le_bytes([pair[0], pair[1]]);
+                let r = ((word >> 11) & 0x1F) as u8;
+                let g = ((word >> 5) & 0x3F) as u8;
+                let b = (word & 0x1F) as u8;
+                [(r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2)]
+            })
+            .collect()
+    }
+
+    fn golden_frame(concept: u8, slug: &str) -> Option<Vec<u8>> {
+        std::fs::read(format!("{GOLDEN_DIR}\\{concept}-{slug}.bin")).ok()
+    }
+
+    fn theme(index: usize) -> QubeThemePalette {
+        QUBE_THEMES[index]
+    }
+
+    /// The app binds this family from the embedded display font at startup; a
+    /// bare `egui::Context` has no such family and epaint panics on the lookup.
+    /// (Twin of `tests::test_context`, which is private to that module.)
+    fn context() -> egui::Context {
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "display_preview".to_owned(),
+            egui::FontData::from_static(include_bytes!("../../assets/Montserrat-Medium.ttf")).into(),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Name("display_preview".into()),
+            vec!["display_preview".to_owned()],
+        );
+        ctx.set_fonts(fonts);
+        ctx
+    }
+
+    #[test]
+    fn preview_paints_only_firmware_roles() {
+        let mut mismatches = Vec::new();
+        for (index, slug) in THEME_SLUGS.iter().enumerate() {
+            let theme = theme(index);
+            for concept in 0..14u8 {
+                let data = data_for(concept, &theme);
+                let rendered = render_preview(&data);
+                let Some(frame) = golden_frame(concept, slug) else {
+                    mismatches.push(format!(
+                        "{concept}/{slug}: нет эталона {GOLDEN_DIR}\\{concept}-{slug}.bin"
+                    ));
+                    continue;
+                };
+                let firmware: BTreeSet<[u8; 3]> = expand565(&frame).into_iter().collect();
+                let extra: Vec<[u8; 3]> = rendered
+                    .requested
+                    .iter()
+                    .copied()
+                    .filter(|colour| !firmware.contains(colour) && *colour != [0, 0, 0])
+                    .collect();
+                if !extra.is_empty() {
+                    mismatches.push(format!(
+                        "{concept}/{slug}: превью красит {extra:?}, чего нет в кадре прошивки"
+                    ));
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "превью использует цвета, которых прошивка не рисует:\n  {}",
+            mismatches.join("\n  ")
+        );
+    }
+
+    #[test]
+    fn golden_frame_parity_report() {
+        let mut lines = Vec::new();
+        let mut identical = 0usize;
+        for (index, slug) in THEME_SLUGS.iter().enumerate() {
+            let theme = theme(index);
+            for concept in 0..14u8 {
+                let data = data_for(concept, &theme);
+                let rendered = render_preview(&data);
+                let preview_hash = sha256_hex(&rgb565_bytes(&rendered.rgb));
+                let expected = GOLDENS
+                    .iter()
+                    .find(|(id, theme_slug, _)| *id == concept && theme_slug == slug)
+                    .map(|(_, _, hash)| *hash)
+                    .expect("golden");
+                if preview_hash == expected {
+                    identical += 1;
+                }
+                let frame = golden_frame(concept, slug);
+                let delta = frame
+                    .as_ref()
+                    .map(|frame| {
+                        let reference = expand565(frame);
+                        rendered
+                            .rgb
+                            .iter()
+                            .zip(reference.iter())
+                            .filter(|(a, b)| a != b)
+                            .count()
+                    })
+                    .unwrap_or(0);
+                lines.push(format!(
+                    "{concept:<3} {slug:<9} {} {} {delta:>6}",
+                    &preview_hash[..16],
+                    &expected[..16],
+                ));
+                if let Some(frame) = frame {
+                    let _ = write_diff(concept, slug, &rendered.rgb, &expand565(&frame));
+                }
+            }
+        }
+        println!("концепция тема      превью            прошивка          дельта, пикс.");
+        for line in &lines {
+            println!("{line}");
+        }
+        println!(
+            "кадров: {}, совпало байт в байт: {identical}",
+            lines.len()
+        );
+    }
+
+    fn write_diff(concept: u8, slug: &str, preview: &[[u8; 3]], firmware: &[[u8; 3]]) {
+        let width = SCREEN_WIDTH as u32;
+        let height = SCREEN_HEIGHT as u32;
+        let mut image = image::RgbImage::new(width, height);
+        let mut preview_image = image::RgbImage::new(width, height);
+        for (index, (a, b)) in preview.iter().zip(firmware.iter()).enumerate() {
+            let (x, y) = (index as u32 % width, index as u32 / width);
+            preview_image.put_pixel(x, y, image::Rgb(*a));
+            if a != b {
+                image.put_pixel(x, y, image::Rgb([255, 0, 0]));
+            } else {
+                let grey = ((u32::from(a[0]) + u32::from(a[1]) + u32::from(a[2])) / 8) as u8;
+                image.put_pixel(x, y, image::Rgb([grey, grey, grey]));
+            }
+        }
+        // The firmware frames themselves are written by the stand
+        // (`qube-concepts-stand --goldens`) into `outputs\entropy-qube\goldens`.
+        let _ = std::fs::create_dir_all(DIFF_DIR);
+        let _ = image.save(format!("{DIFF_DIR}\\{concept}-{slug}.png"));
+        let _ = preview_image.save(format!("{DIFF_DIR}\\{concept}-{slug}-preview.png"));
+    }
+
+    /// SHA-256 (FIPS 180-4). Verbatim twin of
+    /// `work/concepts-stand/src/sha256.rs`: the oracle and this test must hash
+    /// the frame the same way, so the code is duplicated instead of adding a
+    /// crate the offline registry does not carry.
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    fn sha256_compress(state: &mut [u32; 8], block: &[u8]) {
+        let mut w = [0u32; 64];
+        for (index, word) in w.iter_mut().take(16).enumerate() {
+            let base = index * 4;
+            *word = u32::from_be_bytes([
+                block[base],
+                block[base + 1],
+                block[base + 2],
+                block[base + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 =
+                w[index - 2].rotate_right(17) ^ w[index - 2].rotate_right(19) ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+        let mut v = *state;
+        for index in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+            let temp1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let temp2 = s0.wrapping_add(maj);
+            v[7] = v[6];
+            v[6] = v[5];
+            v[5] = v[4];
+            v[4] = v[3].wrapping_add(temp1);
+            v[3] = v[2];
+            v[2] = v[1];
+            v[1] = v[0];
+            v[0] = temp1.wrapping_add(temp2);
+        }
+        for index in 0..8 {
+            state[index] = state[index].wrapping_add(v[index]);
+        }
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        let mut state: [u32; 8] = [
+            0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+            0x5be0cd19,
+        ];
+        let mut chunks = data.chunks_exact(64);
+        for chunk in &mut chunks {
+            sha256_compress(&mut state, chunk);
+        }
+        let tail = chunks.remainder();
+        let mut last = [0u8; 128];
+        last[..tail.len()].copy_from_slice(tail);
+        last[tail.len()] = 0x80;
+        let total_bits = (data.len() as u64).wrapping_mul(8);
+        let block_len = if tail.len() + 9 <= 64 { 64 } else { 128 };
+        last[block_len - 8..block_len].copy_from_slice(&total_bits.to_be_bytes());
+        sha256_compress(&mut state, &last[..64]);
+        if block_len == 128 {
+            sha256_compress(&mut state, &last[64..128]);
+        }
+        state.iter().map(|word| format!("{word:08x}")).collect()
+    }
+
+    #[test]
+    fn sha256_matches_the_known_vectors() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+}
