@@ -175,7 +175,10 @@ impl EntropyApp {
                                 .position(|theme| {
                                     theme.matches(&self.qube_screen_settings.values)
                                 })
-                                .unwrap_or(theme_labels.len());
+                                // Never an in-range index by accident: a custom
+                                // palette highlights no preset instead of
+                                // pointing at a neighbour.
+                                .unwrap_or(usize::MAX);
                             let control_width =
                                 metrics.settings_content_width() - metrics.value(8.0);
                             if let Some(picked) = crate::ui_style::settings_segmented_control(

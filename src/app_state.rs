@@ -2564,6 +2564,26 @@ fn qube_screen_field(
 /// follow the firmware QSID order. A colour row is only offered when all three
 /// of its channels are present, so the app never writes a half-supported
 /// colour.
+/// Role of a Qube colour channel: 0 red, 1 green, 2 blue. `None` for anything
+/// that is not a colour channel of the screen palette.
+pub(crate) fn qube_color_channel(qsid: u16) -> Option<usize> {
+    const TRIPLES: [[u16; 3]; 10] = [
+        [320, 321, 322],
+        [224, 225, 226],
+        [330, 331, 332],
+        [230, 231, 232],
+        [233, 234, 235],
+        [236, 237, 238],
+        [239, 240, 241],
+        [242, 243, 244],
+        [245, 246, 247],
+        [248, 249, 250],
+    ];
+    TRIPLES
+        .iter()
+        .find_map(|triple| triple.iter().position(|candidate| *candidate == qsid))
+}
+
 pub(crate) fn qube_screen_fields(supported_qmk_settings: &[u16]) -> Vec<QubeScreenField> {
     // The 216..=228 block is what identifies Qube display firmware. The shared
     // brightness and colour ids (318, 320..=332) are also used by the macropad

@@ -23,6 +23,20 @@ pub(super) fn qmk_setting_write_policy(qsid: u16) -> QmkSettingWritePolicy {
     }
 }
 
+/// Value to send (and therefore expect back) for a colour channel. The firmware
+/// stores colours in RGB565, so the channel is quantised before the write: the
+/// device then reads back exactly the value we asked for (80 is sent as 82, 225
+/// as 231, …) and an applied colour is not reported as a failed write.
+pub(super) fn quantize_qmk_setting_write(qsid: u16, requested: u16) -> u16 {
+    let Some(channel) = crate::app::app_state::qube_color_channel(qsid) else {
+        return requested;
+    };
+    u16::from(crate::app::qube_screen_preview_ui::five_six_five_channel(
+        channel,
+        requested.min(u16::from(u8::MAX)) as u8,
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SettingsWriteStatus {
     Pending,
@@ -405,7 +419,8 @@ fn run_settings_write(
     } else {
         QmkSettingWritePolicy::SetOnly
     };
-    write_qmk_setting_value(hid, request.qsid, request.width, request.requested, policy)
+        let requested = quantize_qmk_setting_write(request.qsid, request.requested);
+        write_qmk_setting_value(hid, request.qsid, request.width, requested, policy)
 }
 
 #[cfg(not(target_arch = "wasm32"))]

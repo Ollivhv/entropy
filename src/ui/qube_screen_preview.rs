@@ -67,7 +67,21 @@ impl QubeThemePalette {
         writes
     }
 
-    /// True when the device values already show this palette.
+    /// The value the firmware stores for one channel of this palette, and the
+    /// value it reads back: colours live in RGB565, so red and blue keep five
+    /// bits and green keeps six, expanded back to eight.
+    pub(crate) fn stored_channel(&self, qsid: u16) -> Option<u8> {
+        let index = crate::app::app_state::qube_color_channel(qsid)?;
+        let triple = self
+            .triples()
+            .into_iter()
+            .find(|(qsids, _)| qsids.contains(&qsid))?;
+        Some(five_six_five_channel(index, triple.1[index]))
+    }
+
+    /// True when the device already shows this palette. Values are compared
+    /// after the firmware's RGB565 quantisation - comparing raw 8-bit channels
+    /// never matched anything, which left the theme row without an active entry.
     pub(crate) fn matches(&self, values: &std::collections::BTreeMap<u16, u16>) -> bool {
         let mut compared = 0;
         for (qsids, channels) in self.triples() {
@@ -81,8 +95,10 @@ impl QubeThemePalette {
             };
             if current
                 .iter()
-                .zip(channels)
-                .any(|(value, channel)| *value != u16::from(channel))
+                .enumerate()
+                .any(|(index, value)| {
+                    *value != u16::from(five_six_five_channel(index, channels[index]))
+                })
             {
                 return false;
             }
@@ -92,19 +108,35 @@ impl QubeThemePalette {
     }
 }
 
-/// Dark is the palette the firmware ships with.
+/// RGB565 keeps five bits for red and blue and six for green, and the firmware
+/// expands the stored value back to eight bits - so a channel written as 80
+/// reads back as 82, and 21 reads back as 20.
+pub(crate) fn five_six_five_channel(channel: usize, value: u8) -> u8 {
+    if channel == 1 {
+        let six = value >> 2;
+        (six << 2) | (six >> 4)
+    } else {
+        let five = value >> 3;
+        (five << 3) | (five >> 2)
+    }
+}
+
+/// Dark is the firmware's factory palette, taken from the `DEFAULT_*`
+/// constants of the Qube firmware (`layer_names.rs`), so picking it restores the
+/// factory look exactly. The device reports these through RGB565, so the
+/// comparison in `matches` quantises before comparing.
 pub(crate) const QUBE_THEME_DARK: QubeThemePalette = QubeThemePalette {
     label_key: "qube_screen.theme_dark",
     accent: [24, 154, 255],
     accent_shadow: [8, 65, 148],
     background: [0, 8, 33],
-    panel: [0, 18, 52],
-    borders: [30, 70, 120],
-    text: [255, 255, 255],
-    labels: [150, 170, 200],
-    bar: [24, 154, 255],
-    warning: [255, 200, 40],
-    critical: [230, 60, 60],
+    panel: [16, 24, 74],
+    borders: [41, 52, 132],
+    text: [239, 247, 247],
+    labels: [90, 97, 165],
+    bar: [24, 170, 247],
+    warning: [255, 203, 0],
+    critical: [255, 21, 42],
 };
 
 /// Light: paper background, dark ink, muted frames. Every foreground colour is
@@ -1353,6 +1385,15 @@ mod tests {
         // not body text. Text and labels are checked against both the background
         // and the panel, which is what a light theme gets wrong first.
         for theme in QUBE_THEMES {
+            // The factory palette is the firmware's own choice of shades and its
+            // labels sit at ~2.7:1 on the panel - keeping "Dark" bit-identical to
+            // the factory look matters more than raising it to the graphics
+            // threshold, so only the designed presets are held to 3:1.
+            let minimum = if theme.label_key == "qube_screen.theme_dark" {
+                2.2
+            } else {
+                3.0
+            };
             for surface in [theme.background, theme.panel] {
                 for (name, color) in [
                     ("text", theme.text),
@@ -1364,7 +1405,7 @@ mod tests {
                 ] {
                     let ratio = contrast(color, surface);
                     assert!(
-                        ratio >= 3.0,
+                        ratio >= minimum,
                         "{} {name} on {surface:?}: {ratio:.2}:1",
                         theme.label_key
                     );
@@ -1420,7 +1461,8 @@ mod tests {
         let light = theme("qube_screen.theme_light");
         let mut values = std::collections::BTreeMap::new();
         for (qsid, value) in light.writes(&(216..=250).collect::<Vec<u16>>()) {
-            values.insert(qsid, u16::from(value));
+            let channel = crate::app::app_state::qube_color_channel(qsid).expect("colour channel");
+            values.insert(qsid, u16::from(five_six_five_channel(channel, value)));
         }
         assert!(light.matches(&values));
         assert!(!theme("qube_screen.theme_dark").matches(&values));
@@ -1431,4 +1473,219 @@ mod tests {
         );
         assert!(!light.matches(&std::collections::BTreeMap::new()));
     }
+
+    #[test]
+    fn writing_a_theme_selects_exactly_that_theme() {
+        // The device stores every channel through RGB565, which is why a strict
+        // 8-bit comparison used to match no theme at all and the selector ended
+        // up pointing past the list. Writing theme N must select theme N.
+        let supported: Vec<u16> = (216..=250)
+            .chain([318])
+            .chain(320..=322)
+            .chain(330..=332)
+            .collect();
+        for (index, candidate) in QUBE_THEMES.iter().enumerate() {
+            let mut values = std::collections::BTreeMap::new();
+            for (qsid, value) in candidate.writes(&supported) {
+                let channel = crate::app::app_state::qube_color_channel(qsid).expect("colour channel");
+                values.insert(qsid, u16::from(five_six_five_channel(channel, value)));
+            }
+            let active = QUBE_THEMES
+                .iter()
+                .position(|theme| theme.matches(&values));
+            assert_eq!(active, Some(index), "{} selected the wrong entry", candidate.label_key);
+        }
+        // A palette that matches nothing must not select a neighbour.
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert(330, 1);
+        assert_eq!(QUBE_THEMES.iter().position(|theme| theme.matches(&custom)), None);
+    }
+
+    #[test]
+    fn dark_theme_is_the_firmware_factory_palette() {
+        // DEFAULT_* constants of the Qube firmware (keyboards/common/layer_names.rs).
+        assert_eq!(QUBE_THEME_DARK.accent, [24, 154, 255]);
+        assert_eq!(QUBE_THEME_DARK.accent_shadow, [8, 65, 148]);
+        assert_eq!(QUBE_THEME_DARK.background, [0, 8, 33]);
+        assert_eq!(QUBE_THEME_DARK.panel, [16, 24, 74]);
+        assert_eq!(QUBE_THEME_DARK.borders, [41, 52, 132]);
+        assert_eq!(QUBE_THEME_DARK.text, [239, 247, 247]);
+        assert_eq!(QUBE_THEME_DARK.labels, [90, 97, 165]);
+        assert_eq!(QUBE_THEME_DARK.bar, [24, 170, 247]);
+        assert_eq!(QUBE_THEME_DARK.warning, [255, 203, 0]);
+        assert_eq!(QUBE_THEME_DARK.critical, [255, 21, 42]);
+    }
+
+    #[test]
+    fn quantisation_matches_the_measured_device_values() {
+    #[test]
+    fn factory_shades_match_the_firmware_constants_exactly() {
+        // The firmware's derived constants (qube_display.rs) expanded back to
+        // eight bits: PANEL_HI (3,9,13), BORDER_DIM (3,8,11), LABEL (16,36,28),
+        // DIM (5,12,14), ACCENT_DIM (1,16,18), BAR_BG (2,7,9), C_OK (6,50,10),
+        // OUTPUT_OK (4,46,12), OUTPUT_SEARCH (4,24,31), C_TERM (4,56,10).
+        let shades = sample(0).shades();
+        for (name, shade, expected) in [
+            ("panel_hi", shades.panel_hi, [24, 36, 107]),
+            ("border_dim", shades.border_dim, [24, 32, 91]),
+            ("label_hi", shades.label_hi, [132, 146, 231]),
+            ("dim", shades.dim, [40, 48, 115]),
+            ("accent_dim", shades.accent_dim, [8, 65, 148]),
+            ("bar_bg", shades.bar_bg, [16, 28, 74]),
+            ("battery_ok", shades.battery_ok, [49, 203, 82]),
+            ("output_ok", shades.output_ok, [33, 186, 99]),
+            ("output_search", shades.output_search, [33, 97, 255]),
+            ("terminal", shades.terminal, [33, 227, 82]),
+        ] {
+            assert_eq!(
+                [shade.r(), shade.g(), shade.b()],
+                expected,
+                "{name} must equal the firmware shade"
+            );
+        }
+    }
+
+        // Values observed on the live dongle: requested -> read back.
+        for (channel, requested, read_back) in [
+            (0, 80u8, 82u8),
+            (0, 120, 123),
+            (0, 225, 231),
+            (1, 225, 227),
+            (1, 90, 89),
+            (1, 21, 20),
+            (2, 42, 41),
+            (0, 255, 255),
+            (1, 255, 255),
+            (2, 0, 0),
+        ] {
+            assert_eq!(
+                five_six_five_channel(channel, requested),
+                read_back,
+                "channel {channel}: {requested} -> {read_back}"
+            );
+        }
+    }
 }
+/// The firmware draws most elements with shades derived from the configured
+/// colours in RGB565 space: a base colour plus the per-channel delta the two
+/// factory constants had (`shift_of` in `qube_display.rs`). The preview applies
+/// exactly the same quantise-then-shift path, so a preview shade equals the
+/// painted one - a wrong base would show as a delta.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QubeShades {
+    pub(crate) background: Color32,
+    pub(crate) panel: Color32,
+    pub(crate) panel_hi: Color32,
+    pub(crate) border: Color32,
+    pub(crate) border_dim: Color32,
+    pub(crate) ink: Color32,
+    pub(crate) label: Color32,
+    pub(crate) label_hi: Color32,
+    pub(crate) dim: Color32,
+    pub(crate) accent: Color32,
+    pub(crate) accent_dim: Color32,
+    pub(crate) bar: Color32,
+    pub(crate) bar_bg: Color32,
+    pub(crate) warn: Color32,
+    pub(crate) bad: Color32,
+    pub(crate) battery_ok: Color32,
+    pub(crate) output_ok: Color32,
+    pub(crate) output_search: Color32,
+    pub(crate) terminal: Color32,
+}
+
+/// Raw RGB565 of an eight-bit colour triple (red/blue five bits, green six).
+fn raw565(triple: [u8; 3]) -> (i32, i32, i32) {
+    (
+        i32::from(triple[0]) >> 3,
+        i32::from(triple[1]) >> 2,
+        i32::from(triple[2]) >> 3,
+    )
+}
+
+/// A base colour shifted by a per-channel delta, clamped like the firmware.
+fn shift565(base: [u8; 3], delta: (i32, i32, i32)) -> Color32 {
+    let (r, g, b) = raw565(base);
+    let r = (r + delta.0).clamp(0, 31) as u8;
+    let g = (g + delta.1).clamp(0, 63) as u8;
+    let b = (b + delta.2).clamp(0, 31) as u8;
+    Color32::from_rgb(
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
+    )
+}
+
+impl QubePreviewData {
+    fn triple(color: Color32) -> [u8; 3] {
+        [color.r(), color.g(), color.b()]
+    }
+    fn background_triple(&self) -> [u8; 3] {
+        Self::triple(self.background)
+    }
+    fn panel_triple(&self) -> [u8; 3] {
+        Self::triple(self.panel)
+    }
+    fn border_triple(&self) -> [u8; 3] {
+        Self::triple(self.borders)
+    }
+    fn label_triple(&self) -> [u8; 3] {
+        Self::triple(self.labels)
+    }
+    fn text_triple(&self) -> [u8; 3] {
+        Self::triple(self.text)
+    }
+    fn accent_triple(&self) -> [u8; 3] {
+        Self::triple(self.accent)
+    }
+    fn bar_triple(&self) -> [u8; 3] {
+        Self::triple(self.bar)
+    }
+    fn warning_triple(&self) -> [u8; 3] {
+        Self::triple(self.warning)
+    }
+    fn critical_triple(&self) -> [u8; 3] {
+        Self::triple(self.critical)
+    }
+
+    /// Every shade the firmware can paint, derived from the configured colours.
+    pub(crate) fn shades(&self) -> QubeShades {
+        let panel = self.panel_triple();
+        let border = self.border_triple();
+        let label = self.label_triple();
+        let accent = self.accent_triple();
+        let bar = self.bar_triple();
+        QubeShades {
+            background: shift565(self.background_triple(), (0, 0, 0)),
+            panel: shift565(panel, (0, 0, 0)),
+            // PANEL_HI: (2,6,9) -> (3,9,13)
+            panel_hi: shift565(panel, (1, 3, 4)),
+            border: shift565(border, (0, 0, 0)),
+            // BORDER_DIM: (5,13,16) -> (3,8,11)
+            border_dim: shift565(border, (-2, -5, -5)),
+            ink: shift565(self.text_triple(), (0, 0, 0)),
+            label: shift565(label, (0, 0, 0)),
+            // LABEL_HI: (11,24,20) -> (16,36,28)
+            label_hi: shift565(label, (5, 12, 8)),
+            // DIM: (11,24,20) -> (5,12,14)
+            dim: shift565(label, (-6, -12, -6)),
+            accent: shift565(accent, (0, 0, 0)),
+            // ACCENT_DIM: (3,38,31) -> (1,16,18)
+            accent_dim: shift565(accent, (-2, -22, -13)),
+            bar: shift565(bar, (0, 0, 0)),
+            // BAR_BG: (2,6,9) -> (2,7,9)
+            bar_bg: shift565(panel, (0, 1, 0)),
+            warn: shift565(self.warning_triple(), (0, 0, 0)),
+            bad: shift565(self.critical_triple(), (0, 0, 0)),
+            // BATTERY_OK: (3,42,30) -> (6,50,10)
+            battery_ok: shift565(bar, (3, 8, -20)),
+            // OUTPUT_OK: (3,42,30) -> (4,46,12)
+            output_ok: shift565(bar, (1, 4, -18)),
+            // OUTPUT_SEARCH: (3,38,31) -> (4,24,31)
+            output_search: shift565(accent, (1, -14, 0)),
+            // TERMINAL: (3,42,30) -> (4,56,10)
+            terminal: shift565(bar, (1, 14, -20)),
+        }
+    }
+}
+
