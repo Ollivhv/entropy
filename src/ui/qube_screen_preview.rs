@@ -203,6 +203,8 @@ pub(crate) struct QubePreviewData {
     pub(crate) header_mode: u8,
     /// 0 badge in the header, 1 badge as a chip.
     pub(crate) badge_place: u8,
+    /// QSID 318: software dimming of the finished frame, `10..=100`.
+    pub(crate) brightness: u8,
     pub(crate) accent: Color32,
     pub(crate) accent_shadow: Color32,
     pub(crate) background: Color32,
@@ -301,7 +303,159 @@ fn font(size: f32, scale: f32) -> egui::FontId {
     egui::FontId::new(size * scale, egui::FontFamily::Name("display_preview".into()))
 }
 
+// ---------------------------------------------------------------------------
+// The firmware renderer
+// ---------------------------------------------------------------------------
+//
+// The preview shows the frame the *device* paints. `crate::qube_fw` compiles
+// the firmware's own display engine (`qube_display.rs` of `work/my-config`,
+// branch `concepts`) against host stubs, renders it into a 280×240 RGB565
+// buffer and hands the result over as an egui texture; nothing here draws the
+// screen any more. The stylised painter below is kept as a fallback for targets
+// that cannot host the engine (wasm) and for diagnosing the panel itself.
+
+/// Paint the preview with the firmware engine. `false` selects the stylised
+/// fallback.
+pub(crate) const QUBE_PREVIEW_FIRMWARE: bool = cfg!(not(target_arch = "wasm32"));
+
+/// Media line the preview shows. The app is not a media source: the line comes
+/// from the host's now-playing over the RMK host protocol, so the preview uses
+/// the same demo line the golden frames were rendered with.
+const PREVIEW_MEDIA: &str = "Boards of Canada - Roygbiv";
+
+/// The panel's own preview frame, as the firmware would paint it.
+#[cfg(not(target_arch = "wasm32"))]
+fn preview_frame(data: &QubePreviewData, clock: Option<(u8, u8)>) -> crate::qube_fw::HostLcd {
+    crate::qube_fw::render_frame(&preview_input(data, clock))
+}
+
+/// One preview state in the firmware renderer's vocabulary: the settings the
+/// device reports back, plus the host-protocol values the app has to supply.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn preview_input(
+    data: &QubePreviewData,
+    clock: Option<(u8, u8)>,
+) -> crate::qube_fw::PreviewInput {
+    let triple = |color: Color32| {
+        let [r, g, b, _] = color.to_srgba_unmultiplied();
+        [r, g, b]
+    };
+    let (hour, minute) = match clock {
+        Some((hour, minute)) => (Some(hour), Some(minute)),
+        None => (None, None),
+    };
+    crate::qube_fw::PreviewInput {
+        concept: data.concept,
+        // `COLOR_ROLES` order: accent, accent shadow, background, panel,
+        // border, text, label, bar, warning, critical.
+        colors: [
+            triple(data.accent),
+            triple(data.accent_shadow),
+            triple(data.background),
+            triple(data.panel),
+            triple(data.borders),
+            triple(data.text),
+            triple(data.labels),
+            triple(data.bar),
+            triple(data.warning),
+            triple(data.critical),
+        ],
+        brightness: data.brightness.clamp(10, 100),
+        show_wpm: data.show_wpm,
+        show_modifiers: data.show_modifiers,
+        show_batteries: data.show_batteries,
+        show_output: data.show_connection,
+        header_mode: data.header_mode.min(2),
+        output_place: data.badge_place.min(1),
+        layer: data.layer_index.min(u8::MAX as usize) as u8,
+        layer_name: data.layer_label(),
+        // Both halves are treated as connected: the preview shows the panel a
+        // working dongle would show, and the levels are the device's own.
+        batteries: [
+            (Some(data.battery_left.min(100)), true),
+            (Some(data.battery_right.min(100)), true),
+        ],
+        // The app only knows whether the selected device talks over Bluetooth;
+        // the preview shows the badge the stylised one showed for that case
+        // (`BT2*`), which is the pairing state of profile 2.
+        link: if data.bluetooth {
+            crate::qube_fw::Link::Pairing { profile: 2 }
+        } else {
+            crate::qube_fw::Link::Usb
+        },
+        wpm: PREVIEW_WPM,
+        // A preview has no keyboard attached, so no modifiers are held.
+        modifiers: 0,
+        caps_lock: false,
+        num_lock: false,
+        hour,
+        minute,
+        media: PREVIEW_MEDIA.to_owned(),
+    }
+}
+
+/// Local wall clock, the value the device shows in its header.
+#[cfg(not(target_arch = "wasm32"))]
+fn local_clock() -> Option<(u8, u8)> {
+    use chrono::Timelike;
+    let now = chrono::Local::now();
+    Some((now.hour() as u8, now.minute() as u8))
+}
+
+/// Blits the firmware frame into the panel. The factor is a whole number while
+/// the panel is at least as wide as the device screen, so every device pixel
+/// covers an exact square of screen points and the frame stays sharp; a panel
+/// narrower than 280 pt has to scale down fractionally and the filter stays
+/// `NEAREST` so the edges do not smear.
+#[cfg(not(target_arch = "wasm32"))]
+fn paint_firmware_preview(ui: &egui::Ui, screen: egui::Rect, data: &QubePreviewData) {
+    let frame = preview_frame(data, local_clock());
+    let image = egui::ColorImage::from_rgb(
+        [
+            crate::qube_fw::SCREEN_W_PX as usize,
+            crate::qube_fw::SCREEN_H_PX as usize,
+        ],
+        &frame.rgb8_bytes(),
+    );
+    let texture = ui.ctx().load_texture(
+        "qube_screen_preview_frame",
+        image,
+        egui::TextureOptions::NEAREST,
+    );
+    let whole = (screen.width() / SCREEN_WIDTH).floor();
+    let scale = if whole >= 1.0 {
+        whole
+    } else {
+        screen.width() / SCREEN_WIDTH
+    };
+    let target = egui::Rect::from_center_size(
+        screen.center(),
+        egui::vec2(SCREEN_WIDTH * scale, SCREEN_HEIGHT * scale),
+    );
+    ui.painter().image(
+        texture.id(),
+        target,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+}
+
 pub(crate) fn paint_qube_screen_preview(
+    ui: &egui::Ui,
+    screen: egui::Rect,
+    data: &QubePreviewData,
+) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if QUBE_PREVIEW_FIRMWARE {
+        paint_firmware_preview(ui, screen, data);
+        return;
+    }
+    paint_stylized_preview(ui, screen, data);
+}
+
+/// Fallback painter: the same elements as the firmware, laid out by the app's
+/// own font. Only reachable when [`QUBE_PREVIEW_FIRMWARE`] is off.
+fn paint_stylized_preview(
     ui: &egui::Ui,
     screen: egui::Rect,
     data: &QubePreviewData,
@@ -1260,6 +1414,7 @@ mod tests {
             show_connection: true,
             header_mode: 2,
             badge_place: 0,
+            brightness: 100,
             accent: Color32::from_rgb(24, 154, 255),
             accent_shadow: Color32::from_rgb(8, 65, 148),
             background: Color32::from_rgb(0, 8, 33),
@@ -1357,7 +1512,10 @@ mod tests {
                 egui::Pos2::ZERO,
                 egui::vec2(SCREEN_WIDTH, SCREEN_HEIGHT),
             );
-            paint_qube_screen_preview(ui, screen, data);
+            // The shape-collecting tests describe the fallback painter; the
+            // firmware renderer is compared against the goldens in
+            // `firmware_parity`.
+            paint_stylized_preview(ui, screen, data);
         });
         let mut frame = Frame::default();
         for clipped in &output.shapes {
@@ -1773,29 +1931,20 @@ impl QubePreviewData {
 }
 
 // ---------------------------------------------------------------------------
-// Firmware parity harness
+// Firmware parity
 // ---------------------------------------------------------------------------
 //
 // The stand `work/concepts-stand` compiles the *shipped* firmware file
-// (`work/my-config/rmk-qube/qube_display.rs`) against host stubs and can dump
-// one raw RGB565 frame per (concept, theme) together with its SHA-256
-// (`--goldens <dir>`). The module below renders the app preview headlessly,
-// converts it to the same RGB565 byte image and compares:
+// (`work/my-config/rmk-qube/qube_display.rs`) against host stubs and dumps one
+// raw RGB565 frame per (concept, theme) together with its SHA-256
+// (`--goldens <dir>`). Those files are the oracle in `outputs\entropy-qube\goldens`.
 //
-// * `preview_paints_only_firmware_roles` — enforced: every colour the preview
-//   asks the painter for must be a colour the firmware really puts on the glass
-//   for that screen and palette. This is the check that catches "the preview
-//   uses the base colour where the dongle uses a derived shade", which is what
-//   the user sees when a theme looks different on the dongle.
-// * `golden_frame_parity_report` — diagnostic: the byte-for-byte delta against
-//   the firmware frame, with a diff PNG. It prints the table and never fails on
-//   the delta, because the preview is a *stylised* redraw (Montserrat text and
-//   its own coordinates) and cannot be pixel-equal until it is ported to the
-//   firmware's FONT_6X10 / FONT_8X13 / FONT_10X20 rasteriser and layout.
-#[cfg(test)]
+// The preview now renders through the same engine (`crate::qube_fw`), so the
+// test below is exact: every one of the 14 concepts × 4 themes must produce the
+// golden frame byte for byte. A failure writes a diff PNG and prints the pair.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod firmware_parity {
     use super::*;
-    use std::collections::BTreeSet;
 
     /// `outputs\entropy-qube\goldens` — raw frames and the hash table written by
     /// `qube-concepts-stand --goldens <dir>`.
@@ -1870,16 +2019,6 @@ mod firmware_parity {
     /// Theme order of `QUBE_THEMES`, with the slug the golden files use.
     const THEME_SLUGS: [&str; 4] = ["dark", "light", "phosphor", "amber"];
 
-    fn clamp_byte(value: i32) -> u8 {
-        value.clamp(0, 255) as u8
-    }
-
-    /// Colour a vertex asks for, straight (non-premultiplied) eight-bit RGB.
-    fn vertex_rgb(color: Color32) -> [u8; 3] {
-        let [r, g, b, _] = color.to_srgba_unmultiplied();
-        [r, g, b]
-    }
-
     /// The preview data the app builds after writing `theme`: every channel is
     /// quantised to RGB565, which is what the device reads back.
     fn data_for(concept: u8, theme: &QubeThemePalette) -> QubePreviewData {
@@ -1898,6 +2037,7 @@ mod firmware_parity {
             show_connection: true,
             header_mode: 2,
             badge_place: 0,
+            brightness: 100,
             accent: colour(theme.accent),
             accent_shadow: colour(theme.accent_shadow),
             background: colour(theme.background),
@@ -1914,148 +2054,6 @@ mod firmware_parity {
             battery_right: 41,
             bluetooth: false,
         }
-    }
-
-    /// Headless 280×240 render of the preview plus the set of colours the
-    /// painter was asked to draw with.
-    struct Rendered {
-        rgb: Vec<[u8; 3]>,
-        requested: BTreeSet<[u8; 3]>,
-    }
-
-    fn render_preview(data: &QubePreviewData) -> Rendered {
-        let ctx = context();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(SCREEN_WIDTH, SCREEN_HEIGHT),
-            )),
-            ..Default::default()
-        };
-        let output = ctx.run_ui(input, |ui| {
-            let screen =
-                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SCREEN_WIDTH, SCREEN_HEIGHT));
-            paint_qube_screen_preview(ui, screen, data);
-        });
-        let primitives = ctx.tessellate(output.shapes, 1.0);
-        let atlas = ctx.fonts(|fonts| fonts.image());
-
-        let width = SCREEN_WIDTH as usize;
-        let height = SCREEN_HEIGHT as usize;
-        let mut canvas = vec![Color32::TRANSPARENT; width * height];
-        let mut requested = BTreeSet::new();
-        for clipped in &primitives {
-            let egui::epaint::Primitive::Mesh(mesh) = &clipped.primitive else {
-                continue;
-            };
-            for vertex in &mesh.vertices {
-                requested.insert(vertex_rgb(vertex.color));
-            }
-            for triangle in mesh.indices.chunks_exact(3) {
-                paint_triangle(&mut canvas, &atlas, mesh, clipped.clip_rect, triangle);
-            }
-        }
-
-        let rgb = canvas
-            .iter()
-            .map(|colour| {
-                let [r, g, b, _] = colour.to_srgba_unmultiplied();
-                [r, g, b]
-            })
-            .collect();
-        Rendered { rgb, requested }
-    }
-
-    /// One textured triangle of the tessellated preview, sampled the way the
-    /// shader would: the atlas holds white with coverage in alpha, so the vertex
-    /// colour scaled by that coverage is composited over the canvas.
-    fn paint_triangle(
-        canvas: &mut [Color32],
-        atlas: &egui::ColorImage,
-        mesh: &egui::Mesh,
-        clip: egui::Rect,
-        triangle: &[u32],
-    ) {
-        let vertex = |index: u32| mesh.vertices[index as usize];
-        let (a, b, c) = (
-            vertex(triangle[0]),
-            vertex(triangle[1]),
-            vertex(triangle[2]),
-        );
-        let area = edge(a.pos, b.pos, c.pos);
-        if area == 0.0 {
-            return;
-        }
-        let width = SCREEN_WIDTH as usize;
-        let height = SCREEN_HEIGHT as usize;
-        let (atlas_w, atlas_h) = (atlas.size[0], atlas.size[1]);
-
-        let min_x = a.pos.x.min(b.pos.x).min(c.pos.x).max(clip.min.x).max(0.0);
-        let max_x = a.pos.x.max(b.pos.x).max(c.pos.x).min(clip.max.x);
-        let min_y = a.pos.y.min(b.pos.y).min(c.pos.y).max(clip.min.y).max(0.0);
-        let max_y = a.pos.y.max(b.pos.y).max(c.pos.y).min(clip.max.y);
-        let x0 = min_x.floor().max(0.0) as usize;
-        let x1 = (max_x.ceil() as usize).min(width);
-        let y0 = min_y.floor().max(0.0) as usize;
-        let y1 = (max_y.ceil() as usize).min(height);
-
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let point = egui::pos2(x as f32 + 0.5, y as f32 + 0.5);
-                let mut w0 = edge(b.pos, c.pos, point) / area;
-                let mut w1 = edge(c.pos, a.pos, point) / area;
-                let mut w2 = edge(a.pos, b.pos, point) / area;
-                if area < 0.0 {
-                    w0 = -w0;
-                    w1 = -w1;
-                    w2 = -w2;
-                }
-                if w0 < 0.0 || w1 < 0.0 || w2 < 0.0 {
-                    continue;
-                }
-                let uv = egui::pos2(
-                    w0 * a.uv.x + w1 * b.uv.x + w2 * c.uv.x,
-                    w0 * a.uv.y + w1 * b.uv.y + w2 * c.uv.y,
-                );
-                let tx = ((uv.x * atlas_w as f32) as isize).clamp(0, atlas_w as isize - 1) as usize;
-                let ty = ((uv.y * atlas_h as f32) as isize).clamp(0, atlas_h as isize - 1) as usize;
-                let coverage = u32::from(atlas.pixels[ty * atlas_w + tx].a());
-                if coverage == 0 {
-                    continue;
-                }
-                let source = a.color;
-                let scale = |channel: u8| u32::from(channel) * coverage / 255;
-                let sr = scale(source.r());
-                let sg = scale(source.g());
-                let sb = scale(source.b());
-                let sa = scale(source.a());
-                let dst = canvas[y * width + x];
-                let inverse = 255 - sa;
-                let mix = |d: u8, s: u32| clamp_byte((u32::from(d) * inverse / 255) as i32 + s as i32);
-                canvas[y * width + x] = Color32::from_rgba_premultiplied(
-                    mix(dst.r(), sr),
-                    mix(dst.g(), sg),
-                    mix(dst.b(), sb),
-                    clamp_byte((u32::from(dst.a()) * inverse / 255) as i32 + sa as i32),
-                );
-            }
-        }
-    }
-
-    fn edge(a: egui::Pos2, b: egui::Pos2, c: egui::Pos2) -> f32 {
-        (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
-    }
-
-    /// Raw little-endian RGB565 byte image, the form the goldens hash.
-    fn rgb565_bytes(rgb: &[[u8; 3]]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(rgb.len() * 2);
-        for pixel in rgb {
-            let word = (u16::from(pixel[0] >> 3) << 11)
-                | (u16::from(pixel[1] >> 2) << 5)
-                | u16::from(pixel[2] >> 3);
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        out
     }
 
     /// Eight-bit expansion of a frame the firmware wrote in RGB565.
@@ -2079,108 +2077,269 @@ mod firmware_parity {
         QUBE_THEMES[index]
     }
 
-    /// The app binds this family from the embedded display font at startup; a
-    /// bare `egui::Context` has no such family and epaint panics on the lookup.
-    /// (Twin of `tests::test_context`, which is private to that module.)
-    fn context() -> egui::Context {
-        let ctx = egui::Context::default();
-        let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert(
-            "display_preview".to_owned(),
-            egui::FontData::from_static(include_bytes!("../../assets/Montserrat-Medium.ttf")).into(),
-        );
-        fonts.families.insert(
-            egui::FontFamily::Name("display_preview".into()),
-            vec!["display_preview".to_owned()],
-        );
-        ctx.set_fonts(fonts);
-        ctx
-    }
+    /// 09:41 — the host clock the oracle frames were rendered with.
+    const PARITY_CLOCK: Option<(u8, u8)> = Some((9, 41));
 
+    /// Every screen the settings page can show must equal the frame the
+    /// firmware paints for the same state — the same bytes, not "close". The
+    /// table is printed for the report; a mismatch writes a diff PNG.
     #[test]
-    fn preview_paints_only_firmware_roles() {
-        let mut mismatches = Vec::new();
-        for (index, slug) in THEME_SLUGS.iter().enumerate() {
-            let theme = theme(index);
-            for concept in 0..14u8 {
-                let data = data_for(concept, &theme);
-                let rendered = render_preview(&data);
-                let Some(frame) = golden_frame(concept, slug) else {
-                    mismatches.push(format!(
-                        "{concept}/{slug}: нет эталона {GOLDEN_DIR}\\{concept}-{slug}.bin"
-                    ));
-                    continue;
-                };
-                let firmware: BTreeSet<[u8; 3]> = expand565(&frame).into_iter().collect();
-                let extra: Vec<[u8; 3]> = rendered
-                    .requested
-                    .iter()
-                    .copied()
-                    .filter(|colour| !firmware.contains(colour) && *colour != [0, 0, 0])
-                    .collect();
-                if !extra.is_empty() {
-                    mismatches.push(format!(
-                        "{concept}/{slug}: превью красит {extra:?}, чего нет в кадре прошивки"
-                    ));
-                }
-            }
-        }
-        assert!(
-            mismatches.is_empty(),
-            "превью использует цвета, которых прошивка не рисует:\n  {}",
-            mismatches.join("\n  ")
-        );
-    }
-
-    #[test]
-    fn golden_frame_parity_report() {
-        let mut lines = Vec::new();
+    fn frames_match_the_firmware_byte_for_byte() {
+        let mut lines = vec!["концепция  тема       дельта, пикс.  sha256 превью".to_owned()];
         let mut identical = 0usize;
+        let mut failures = Vec::new();
         for (index, slug) in THEME_SLUGS.iter().enumerate() {
             let theme = theme(index);
             for concept in 0..14u8 {
                 let data = data_for(concept, &theme);
-                let rendered = render_preview(&data);
-                let preview_hash = sha256_hex(&rgb565_bytes(&rendered.rgb));
+                let frame = preview_frame(&data, PARITY_CLOCK);
+                let actual = frame.rgb565_bytes();
+                let hash = sha256_hex(&actual);
                 let expected = GOLDENS
                     .iter()
                     .find(|(id, theme_slug, _)| *id == concept && theme_slug == slug)
                     .map(|(_, _, hash)| *hash)
                     .expect("golden");
-                if preview_hash == expected {
+                let Some(reference) = golden_frame(concept, slug) else {
+                    failures.push(format!(
+                        "{concept}/{slug}: нет эталона {GOLDEN_DIR}\\{concept}-{slug}.bin"
+                    ));
+                    continue;
+                };
+                let delta = actual
+                    .iter()
+                    .zip(reference.iter())
+                    .filter(|(a, b)| a != b)
+                    .count()
+                    / 2;
+                lines.push(format!(
+                    "{concept:<10} {slug:<9} {delta:>13}  {}",
+                    &hash[..16]
+                ));
+                if delta != 0 || hash != expected {
+                    let preview_rgb = expand565(&actual);
+                    let _ = write_diff(concept, slug, &preview_rgb, &expand565(&reference));
+                    failures.push(format!(
+                        "{concept}/{slug}: {delta} пикс. отличаются (sha {hash} против {expected})"
+                    ));
+                } else {
                     identical += 1;
                 }
-                let frame = golden_frame(concept, slug);
-                let delta = frame
-                    .as_ref()
-                    .map(|frame| {
-                        let reference = expand565(frame);
-                        rendered
-                            .rgb
-                            .iter()
-                            .zip(reference.iter())
-                            .filter(|(a, b)| a != b)
-                            .count()
-                    })
-                    .unwrap_or(0);
-                lines.push(format!(
-                    "{concept:<3} {slug:<9} {} {} {delta:>6}",
-                    &preview_hash[..16],
-                    &expected[..16],
-                ));
-                if let Some(frame) = frame {
-                    let _ = write_diff(concept, slug, &rendered.rgb, &expand565(&frame));
+                if frame.dropped != 0 {
+                    failures.push(format!(
+                        "{concept}/{slug}: {} пикселей за пределами панели",
+                        frame.dropped
+                    ));
                 }
             }
         }
-        println!("концепция тема      превью            прошивка          дельта, пикс.");
         for line in &lines {
             println!("{line}");
         }
-        println!(
-            "кадров: {}, совпало байт в байт: {identical}",
-            lines.len()
+        println!("кадров: 56, совпало байт в байт: {identical}");
+        assert_eq!(identical, 56, "не все кадры совпали с прошивкой");
+        assert!(
+            failures.is_empty(),
+            "превью расходится с кадрами прошивки:\n  {}",
+            failures.join("\n  ")
         );
+    }
+
+    /// Ink of a region — `(pixels differing from the background, min x, min y,
+    /// max x, max y)`. The background is the colour of the top-left pixel, which
+    /// every concept clears the panel with.
+    fn ink(
+        frame: &crate::qube_fw::HostLcd,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+    ) -> (usize, i32, i32, i32, i32) {
+        let background = frame.pixel(0, 0);
+        let mut count = 0usize;
+        let mut min = (i32::MAX, i32::MAX);
+        let mut max = (i32::MIN, i32::MIN);
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                if frame.pixel(x, y) == background {
+                    continue;
+                }
+                count += 1;
+                min = (min.0.min(x), min.1.min(y));
+                max = (max.0.max(x), max.1.max(y));
+            }
+        }
+        (count, min.0, min.1, max.0, max.1)
+    }
+
+    /// Frame of one concept in one theme, first proved to be the firmware's own:
+    /// the acceptance cases below only mean something on a frame that really
+    /// equals the golden.
+    fn checked_frame(concept: u8, index: usize, slug: &str) -> crate::qube_fw::HostLcd {
+        let frame = preview_frame(&data_for(concept, &theme(index)), PARITY_CLOCK);
+        let golden = golden_frame(concept, slug).expect("эталон");
+        assert_eq!(
+            frame.rgb565_bytes(),
+            golden,
+            "{concept}/{slug}: кадр предпросмотра не равен кадру прошивки"
+        );
+        frame
+    }
+
+    /// Reported: the app wrote the two-column clock into the *left* column
+    /// (`text_at(12.0, 206.0, "09:41", …)` in the stylised painter), while the
+    /// firmware writes it under the battery cards, in the right column
+    /// (`ctext8(d, &st.time(), 158, 204, C_DIM)`).
+    /// Visual evidence: `goldens\7-dark.png`.
+    #[test]
+    fn concept7_clock_lives_in_the_right_column() {
+        let (x, y, width, height) = crate::qube_fw::twocol_clock_box();
+        let divider = crate::qube_fw::twocol_divider_x();
+        for (index, slug) in THEME_SLUGS.iter().enumerate() {
+            let frame = checked_frame(7, index, slug);
+            let (clock, min_x, min_y, max_x, max_y) =
+                ink(&frame, x, y, x + width - 1, y + height - 1);
+            assert!(clock > 0, "7/{slug}: часов нет на месте своей строки");
+            assert!(
+                min_x > divider,
+                "7/{slug}: часы начинаются левее разделителя ({min_x} <= {divider})"
+            );
+            assert!(
+                min_y >= y && max_y < y + height && max_x < x + width,
+                "7/{slug}: часы вылезли из своего бокса ({min_x},{min_y})-({max_x},{max_y})"
+            );
+            // The stylised painter's slot — the bug — has to stay background.
+            let (stray, ..) = ink(&frame, 12, y, divider - 1, y + height - 1);
+            assert_eq!(
+                stray, 0,
+                "7/{slug}: в левой колонке на строке часов что-то нарисовано"
+            );
+        }
+    }
+
+    /// Reported: the app wrote the speedometer's media ticker at the bottom
+    /// *left* (`text_at(12.0, 214.0, …)`), while the firmware centres it under
+    /// the rule (`ctext6c(d, &line, SPEEDO_CENTRE, SPEEDO_MEDIA_Y, C_INK)`).
+    /// Visual evidence: `goldens\5-dark.png`.
+    #[test]
+    fn concept5_media_ticker_is_centred() {
+        let (rule_y, media_y, centre, glyph_h) = crate::qube_fw::speedo_media_row();
+        let last_x = crate::qube_fw::SCREEN_W_PX as i32 - 1;
+        for (index, slug) in THEME_SLUGS.iter().enumerate() {
+            let frame = checked_frame(5, index, slug);
+            // The rule above the ticker spans the panel's safe area.
+            let (rule, rule_x0, _, rule_x1, _) = ink(&frame, 0, rule_y, last_x, rule_y);
+            assert_eq!(
+                (rule, rule_x0, rule_x1),
+                (240, 20, 259),
+                "5/{slug}: линейка над тикером не на месте"
+            );
+            // The ticker itself: inside its glyph box and centred on the panel.
+            let (ticker, min_x, min_y, max_x, max_y) =
+                ink(&frame, 0, media_y, last_x, media_y + glyph_h - 1);
+            assert!(ticker > 0, "5/{slug}: строки медиа нет");
+            assert!(
+                min_y >= media_y && max_y < media_y + glyph_h,
+                "5/{slug}: тикер вылез из своей строки ({min_y}..{max_y})"
+            );
+            let ink_centre = (min_x + max_x) / 2;
+            assert!(
+                (ink_centre - centre).abs() <= 2,
+                "5/{slug}: тикер не по центру — чернила {min_x}..{max_x}, центр {ink_centre} против {centre}"
+            );
+        }
+    }
+
+    /// Reported: the app printed a second battery summary (`L 73% R 41%`) in
+    /// the bottom right corner of the speedometer. The firmware draws the two
+    /// battery cards once, in the upper right, and leaves everything below the
+    /// media ticker empty (`speedo_bottom` draws nothing there).
+    #[test]
+    fn concept5_has_no_second_battery_row() {
+        let (_, media_y, _, glyph_h) = crate::qube_fw::speedo_media_row();
+        let first_empty = media_y + glyph_h;
+        let last_y = crate::qube_fw::SCREEN_H_PX as i32 - 1;
+        for (index, slug) in THEME_SLUGS.iter().enumerate() {
+            let frame = checked_frame(5, index, slug);
+            let (stray, min_x, min_y, max_x, max_y) =
+                ink(&frame, 0, first_empty, crate::qube_fw::SCREEN_W_PX as i32 - 1, last_y);
+            assert_eq!(
+                stray, 0,
+                "5/{slug}: под тикером дорисовано ({min_x},{min_y})-({max_x},{max_y})"
+            );
+        }
+    }
+
+    /// The panel must really blit the firmware frame: one headless egui pass has
+    /// to upload the whole 280×240 frame as a texture and draw it with nearest
+    /// filtering — an integer scale is what keeps the firmware pixels sharp.
+    #[test]
+    fn the_panel_blits_the_firmware_frame() {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(SCREEN_WIDTH, SCREEN_HEIGHT),
+            )),
+            ..Default::default()
+        };
+        let output = ctx.run_ui(input, |ui| {
+            let screen =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(SCREEN_WIDTH, SCREEN_HEIGHT));
+            paint_qube_screen_preview(ui, screen, &data_for(5, &QUBE_THEME_DARK));
+        });
+
+        let (id, delta) = output
+            .textures_delta
+            .set
+            .first()
+            .expect("кадр не загружен как текстура");
+        assert_eq!(
+            delta.image.size(),
+            [SCREEN_WIDTH as usize, SCREEN_HEIGHT as usize],
+            "текстура не во весь кадр"
+        );
+        assert_eq!(
+            delta.options.magnification,
+            egui::TextureFilter::Nearest,
+            "кадр растягивается сглаживающим фильтром"
+        );
+        assert!(delta.pos.is_none(), "кадр должен загружаться целиком");
+        let blitted = output.shapes.iter().any(|clipped| match &clipped.shape {
+            egui::Shape::Mesh(mesh) => mesh.texture_id == *id,
+            _ => false,
+        });
+        assert!(blitted, "кадр загружен, но не нарисован");
+    }
+
+    /// The two firmware files are copies, not forks: apart from the documented
+    /// adaptations (the `//!` → `//` header rewrite and the one `rmk::config`
+    /// import) they have to stay identical to the origin.
+    #[test]
+    fn firmware_sources_are_unmodified() {
+        let origin = std::path::Path::new(
+            r"C:\Users\Ilya\Documents\Codex\2026-10-06\g\work\my-config\rmk-qube",
+        );
+        if !origin.is_dir() {
+            eprintln!("источник {} недоступен — проверка пропущена", origin.display());
+            return;
+        }
+        let normalize = |text: &str| {
+            text.replace("\r\n", "\n")
+                .replace("//!", "//")
+                .replace("use rmk::config::", "use crate::qube_fw::stubs::rmk::config::")
+        };
+        for (copy, name) in [
+            (include_str!("../qube_fw/qube_display.rs"), "qube_display.rs"),
+            (include_str!("../qube_fw/layer_names.rs"), "layer_names.rs"),
+        ] {
+            let expected = std::fs::read_to_string(origin.join(name)).expect("источник");
+            assert_eq!(
+                normalize(copy),
+                normalize(&expected),
+                "{name} отклонился от исходника прошивки"
+            );
+        }
     }
 
     fn write_diff(concept: u8, slug: &str, preview: &[[u8; 3]], firmware: &[[u8; 3]]) {

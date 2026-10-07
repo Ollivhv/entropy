@@ -310,6 +310,7 @@ impl EntropyApp {
             show_connection: value(221, 1) != 0,
             header_mode: value(217, 2).min(2),
             badge_place: value(227, 0).min(1),
+            brightness: value(318, 100),
             accent,
             accent_shadow: color([224, 225, 226], [8, 65, 148]),
             background: color([330, 331, 332], [0, 8, 33]),
