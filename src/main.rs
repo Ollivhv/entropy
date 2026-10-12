@@ -31,6 +31,16 @@ mod text_expander;
 mod ui_style;
 mod universal_symbols;
 
+/// The firmware's screen engine, compiled into the app for the Qube preview
+/// (see `src/qube_fw/mod.rs`). `qube_display.rs` and `layer_names.rs` address
+/// their neighbours as `crate::layer_names`, `crate::DEFAULT_LAYER_NAMES` and
+/// `crate::default_layer_names` — the paths they have inside the firmware
+/// crate — so those three names are re-exported here.
+#[cfg(not(target_arch = "wasm32"))]
+mod qube_fw;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use qube_fw::{default_layer_names, layer_names, DEFAULT_LAYER_NAMES};
+
 use app::EntropyApp;
 
 const APP_TITLE: &str = "Entropy";

@@ -1756,9 +1756,16 @@ fn response_matches_command(command: &[u8], resp: &[u8; MSG_LEN]) -> bool {
         | CMD_VIA_MACRO_SET_BUFFER => resp[0] == cmd,
         CMD_VIA_VIAL_PREFIX => response_matches_vial_command(command, resp),
         0xE6 if is_application_layout_capability_probe(command) => {
+            // 0x5A acknowledges firmware that implements the application-layout
+            // protocol. Firmware that does not implement it answers by echoing
+            // the probe (0xA5) - the M4CR0Pad v2 on firmware 4.0.6 does exactly
+            // that. The echo is a complete answer meaning "not supported": if it
+            // were treated as a stale report, the read would keep waiting until
+            // the deadline and the HID transport would be retired, which drops
+            // the whole connection.
             resp[0] == 0xE6
                 && resp[1] == crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION
-                && resp[2] == 0x5A
+                && matches!(resp[2], 0x5A | 0xA5)
         }
         // Keep reading for this command within the original deadline when a
         // delayed response from another pictogram command arrives. Never resend.
@@ -1840,8 +1847,15 @@ fn response_matches_qmk_settings_get(command: &[u8], resp: &[u8; MSG_LEN]) -> bo
     }
 
     let payload = &resp[1..];
+    // A name answer must be NUL-terminated UTF-8. Some firmwares also park
+    // plain numeric device settings inside this block: the Ergohaven Qube dongle
+    // answers its screen settings (216..=228) with one value byte followed by
+    // 0xFF padding and no string terminator at all. Rejecting that shape does
+    // not make the read safer — it keeps waiting for a reply that will never
+    // come, and the connection is then dropped as a transport failure — so an
+    // answer with nothing name-shaped in it counts as a numeric value.
     let Some(end) = payload.iter().position(|byte| *byte == 0) else {
-        return false;
+        return true;
     };
     end <= 15 && std::str::from_utf8(&payload[..end]).is_ok()
 }
@@ -2334,6 +2348,45 @@ mod tests {
     }
 
     #[test]
+    fn application_layout_probe_accepts_the_unsupported_echo() {
+        // Firmware without the application-layout protocol echoes the probe
+        // instead of acknowledging it. That echo has to count as an answer, so
+        // the caller learns "not supported" right away: waiting for the read
+        // deadline would retire the HID transport and drop the whole
+        // connection, which is what happened on the M4CR0Pad v2 (firmware
+        // 4.0.6) - the app fell back to the device list every time.
+        let request = [
+            0xE6,
+            crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+            0xA5,
+            0,
+            0,
+        ];
+        let mut echo = [0u8; MSG_LEN];
+        echo[..request.len()].copy_from_slice(&request);
+        assert!(response_matches_command(&request, &echo));
+
+        // The acknowledgement still matches.
+        let mut ack = [0u8; MSG_LEN];
+        ack[..3].copy_from_slice(&[
+            0xE6,
+            crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+            0x5A,
+        ]);
+        assert!(response_matches_command(&request, &ack));
+
+        // Unrelated payloads stay rejected.
+        let mut unrelated = [0u8; MSG_LEN];
+        unrelated[..3].copy_from_slice(&[
+            0xE6,
+            crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION,
+            0x11,
+        ]);
+        assert!(!response_matches_command(&request, &unrelated));
+        assert!(!response_matches_command(&request, &[0u8; MSG_LEN]));
+    }
+
+    #[test]
     fn keymap_reads_fail_fast_for_compatibility_fallback() {
         assert_eq!(
             usb_send_max_attempts(HidTransport::Usb, &[CMD_VIA_KEYMAP_GET_BUFFER, 0, 0, 28]),
@@ -2586,6 +2639,34 @@ mod tests {
         let mut valid_name = [0u8; MSG_LEN];
         valid_name[1..5].copy_from_slice(b"Nav\0");
         assert!(response_matches_command(&command, &valid_name));
+    }
+
+    #[test]
+    fn qmk_settings_get_accepts_numeric_answer_inside_the_layer_name_block() {
+        // The Qube dongle stores its screen settings on QSIDs 216..=228, which
+        // lie inside the layer-name block (200..=231). Those ids answer with a
+        // single value byte and 0xFF padding - no string terminator - and the
+        // response must be accepted, otherwise the read waits forever and the
+        // whole connection is dropped as a transport failure.
+        let command = qmk_settings_command(CMD_VIAL_QMK_SETTINGS_GET, 216);
+        let mut numeric = [u8::MAX; MSG_LEN];
+        numeric[0] = 0;
+        numeric[1] = 1;
+        assert!(response_matches_command(&command, &numeric));
+
+        // A string answer to the same id still matches.
+        let mut name = [u8::MAX; MSG_LEN];
+        name[0] = 0;
+        name[1..5].copy_from_slice(b"Base");
+        name[5] = 0;
+        assert!(response_matches_command(&command, &name));
+
+        // A stale payload that does contain a terminator is still rejected.
+        let mut stale = [u8::MAX; MSG_LEN];
+        stale[0] = 0;
+        stale[1] = 0xEA;
+        stale[2] = 0;
+        assert!(!response_matches_command(&command, &stale));
     }
 
     #[test]

@@ -254,6 +254,7 @@ impl EntropyApp {
         self.layer_led_settings = LayerLedSettingsState::default();
         self.rgb_settings = RgbSettingsState::default();
         self.display_settings = DisplaySettingsState::default();
+        self.qube_screen_settings = QubeScreenSettingsState::default();
         self.layout_options_value = None;
         self.sticky_layout_prev_pressed.clear();
         self.sticky_layout_pressed_key_layers.clear();

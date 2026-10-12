@@ -36,6 +36,11 @@ eframe = { version = "0.34.3", default-features = false, features = ["accesskit"
 egui = "0.34.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The Qube screen preview renders the *firmware's* display engine
+# (`src/qube_fw/`), which draws through embedded-graphics into RGB565 and uses
+# heapless strings for its buffers.
+embedded-graphics = "0.8"
+heapless = "0.9"
 emojis = "0.9"
 twemoji-assets = { version = "=1.5.1", default-features = false, features = ["png"] }
 unicode-segmentation = "1.13"

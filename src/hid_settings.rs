@@ -559,6 +559,10 @@ mod tests {
         response[1] = crate::application_layouts::APPLICATION_LAYOUT_PROTOCOL_VERSION;
         response[2] = 0;
         assert!(!application_layout_poll_supported(&response));
+        // Firmware without the protocol echoes the probe (0xA5): a valid answer
+        // that must be read as "not supported", not as a failed read.
+        response[2] = 0xA5;
+        assert!(!application_layout_poll_supported(&response));
         assert!(!application_layout_poll_supported(&[0u8; MSG_LEN]));
     }
 

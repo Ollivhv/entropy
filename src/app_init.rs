@@ -252,6 +252,7 @@ impl EntropyApp {
             last_single_instance_signal,
             rgb_settings: RgbSettingsState::default(),
             display_settings: DisplaySettingsState::default(),
+            qube_screen_settings: QubeScreenSettingsState::default(),
             layout_options_value: None,
             encoder_visibility: vec![],
             combo_term_dirty: false,
